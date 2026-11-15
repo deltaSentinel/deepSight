@@ -132,10 +132,10 @@ void extractAndSavePMKID(const uint8_t* bssid, const uint8_t* payload, int len, 
         int offset = 2;
         offset += 2; // Version
 
-        if (offset + 4 > tagLen) { pos += 2 + tagLen; continue; }
+        //if (offset + 4 > tagLen) { pos += 2 + tagLen; continue; }
         offset += 4; // Group Suite
 
-        if (offset + 2 > tagLen) { pos += 2 + tagLen; continue; }
+        //if (offset + 2 > tagLen) { pos += 2 + tagLen; continue; }
         int pwCnt = payload[pos+offset] | (payload[pos+offset+1] << 8);
         offset += 2 + (pwCnt * 4);
 

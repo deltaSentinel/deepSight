@@ -78,7 +78,7 @@ void loadFilters() {
     configFile.readBytesUntil('\n', line, 64);
     if (strlen(line) < 15) continue;
     char bssidStr[18]; char modeChar;
-    if (sscanf(line, "%[^,],%c", bssidStr, &modeChar) == 2) {
+    if (sscanf(line, "%17[^,],%c", bssidStr, &modeChar) == 2) {
       uint8_t bssid[6];
       sscanf(bssidStr, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx", &bssid[0], &bssid[1], &bssid[2], &bssid[3], &bssid[4], &bssid[5]);
       filters[filterCount].active = true; memcpy(filters[filterCount].bssid, bssid, 6); filters[filterCount].mode = modeChar; filterCount++;
@@ -98,7 +98,7 @@ void loadOuiDatabase() {
     ouiFile.readBytesUntil('\n', line, 128);
     if (strlen(line) < 8) continue;
     char oui[9], vendor[64];
-    if (sscanf(line, "%[^,],%[^,]", oui, vendor) == 2) { strncpy(ouiDatabase[ouiCount].oui, oui, 8); ouiDatabase[ouiCount].oui[8] = '\0'; strncpy(ouiDatabase[ouiCount].vendor, vendor, 63); ouiCount++; }
+    if (sscanf(line, "%8[^,],%63[^,]", oui, vendor) == 2) { strncpy(ouiDatabase[ouiCount].oui, oui, 8); ouiDatabase[ouiCount].oui[8] = '\0'; strncpy(ouiDatabase[ouiCount].vendor, vendor, 63); ouiCount++; }
   }
   ouiFile.close(); ouiLoaded = true;
 }
@@ -113,7 +113,7 @@ void loadKnownDevices() {
     knownDevFile.readBytesUntil('\n', line, 128);
     if (strlen(line) < 10) continue;
     char macStr[18], type[8], nick[32];
-    if (sscanf(line, "%[^,],%[^,],%[^,]", macStr, type, nick) == 3) {
+    if (sscanf(line, "%17[^,],%7[^,],%31[^,]", macStr, type, nick) == 3) {
       uint8_t mac[6];
       sscanf(macStr, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
       memcpy(knownDevices[knownDeviceCount].mac, mac, 6); strncpy(knownDevices[knownDeviceCount].type, type, 7); strncpy(knownDevices[knownDeviceCount].nickname, nick, 31); knownDevices[knownDeviceCount].active = true; knownDeviceCount++;
@@ -132,7 +132,7 @@ void loadVendorAliases() {
     vendorAliasFile.readBytesUntil('\n', line, 128);
     if (strlen(line) < 8) continue;
     char oui[9], alias[64];
-    if (sscanf(line, "%[^,],%[^,]", oui, alias) == 2) { strncpy(vendorAliases[aliasCount].oui, oui, 8); ouiDatabase[ouiCount].oui[8] = '\0'; strncpy(vendorAliases[aliasCount].alias, alias, 63); aliasCount++; }
+    if (sscanf(line, "%8[^,],%63[^,]", oui, alias) == 2) { strncpy(vendorAliases[aliasCount].oui, oui, 8); vendorAliases[aliasCount].oui[8] = '\0'; strncpy(vendorAliases[aliasCount].alias, alias, 63); aliasCount++; }
   }
   vendorAliasFile.close();
 }
@@ -151,12 +151,12 @@ void loadFingerprints() {
     int tRand, tTrans;
     char ciph[8] = "UNK", auth[8] = "UNK", tag[16] = "General";
     // Extended format with new fields
-    if (sscanf(line, "%[^,],%[^,],%[^,],%d,%d,%d,%f,%d,%d,%d,%d,%d,%d,%f,%[^,],%[^,],%d,%[^,]",
+    if (sscanf(line, "%32[^,],%8[^,],%32[^,],%d,%d,%d,%f,%d,%d,%d,%d,%d,%d,%f,%7[^,],%7[^,],%d,%15[^,]",
                id, oui, ssid, &rssi, &ch, &hs, &bw, &cc, &tRand, &wps, &nf, &ts, &tTrans, &util, ciph, auth, &ts, tag) >= 16) {
     fpDB[fpCount].isRandomized = (tRand != 0);
     fpDB[fpCount].isWPA3Transition = (tTrans != 0);
     }
-    else if (sscanf(line, "%[^,],%[^,],%[^,],%d,%d,%d", id, oui, ssid, &rssi, &ch, &hs) == 6) { ts = 0; wps = 0; nf = 0; tTrans = 0; util = 0; bw = 0; cc = 0; tRand = 0; }
+    else if (sscanf(line, "%32[^,],%8[^,],%32[^,],%d,%d,%d", id, oui, ssid, &rssi, &ch, &hs) == 6) { ts = 0; wps = 0; nf = 0; tTrans = 0; util = 0; bw = 0; cc = 0; tRand = 0; }
     else continue;
     strncpy(fpDB[fpCount].id, id, 32); strncpy(fpDB[fpCount].oui, oui, 8); strncpy(fpDB[fpCount].ssid, ssid, 32);
     fpDB[fpCount].avgRssi = rssi; fpDB[fpCount].lastChannel = ch; fpDB[fpCount].handshakeCount = hs;

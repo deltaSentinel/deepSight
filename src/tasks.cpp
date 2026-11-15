@@ -47,7 +47,7 @@ void healthTask(void* param) {
     size_t p = ESP.getFreePsram();
     if (h < MIN_FREE_HEAP || p < MIN_FREE_PSRAM) {
       char buf[64];
-      snprintf(buf, sizeof(buf), "[CRITICAL] Low Memory: Heap=%u, PSRAM=%u. Restarting...\n", h, p);
+      snprintf(buf, sizeof(buf), "[CRITICAL] Low Memory: Heap=%zu, PSRAM=%zu. Restarting...\n", h, p);
       Serial.print(buf);
       ESP.restart();
     }

@@ -104,9 +104,9 @@ struct ChannelStats {
 };
 
 struct FilterEntry { uint8_t bssid[6]; char mode; bool active; };
-struct OuiEntry { char oui[8]; char vendor[64]; };
+struct OuiEntry { char oui[9]; char vendor[64]; };
 struct KnownDevice { uint8_t mac[6]; char type[8]; char nickname[32]; bool active; };
-struct VendorAlias { char oui[8]; char alias[64]; };
+struct VendorAlias { char oui[9]; char alias[64]; };
 struct KarmaTracker { uint8_t bssid[6]; unsigned long lastProbeReq; unsigned long lastProbeResp; int reqCount; int respCount; bool active; };
 struct AnomalyTracker { uint8_t bssid[6]; float avgRssi; int avgPacketsPerSec; unsigned long lastUpdate; bool active; };
 
