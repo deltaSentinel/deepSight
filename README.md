@@ -140,7 +140,7 @@ Contributions are welcome. By submitting a pull request, you agree that your con
 This project is licensed under the **GNU General Public License v3.0**. See [LICENSE](LICENSE) for details.
 
     WIDS — Deep Sight Edition
-    Copyright (C) 2026  WIDS Contributors
+    Copyright (C) 2026  Raymond Balesky
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -154,8 +154,6 @@ This project is licensed under the **GNU General Public License v3.0**. See [LIC
 
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-Replace "WIDS Contributors" with your name or preferred copyright holder.
 
 ---
 
