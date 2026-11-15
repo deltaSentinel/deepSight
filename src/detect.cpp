@@ -10,7 +10,7 @@
 // ======================================================
 
 const char* getVendorFromOui(const uint8_t* mac) {
-  char ouiStr[8];
+  char ouiStr[9];
   snprintf(ouiStr, 9, "%02X:%02X:%02X", mac[0], mac[1], mac[2]);
   for (int i = 0; i < aliasCount; i++)
     if (strcmp(vendorAliases[i].oui, ouiStr) == 0) return vendorAliases[i].alias;

@@ -24,7 +24,7 @@ void initSD() {
   // Initialize file indices
   char tempName[32];
   while (true) {
-    snprintf(tempName, sizeof(tempName), "/log_%lu.tmp", currentLogIndex);
+    snprintf(tempName, sizeof(tempName), "/log_%lu.tmp", (unsigned long)currentLogIndex);
     if (!SD.exists(tempName)) break;
       currentLogIndex++;
 }
@@ -36,7 +36,7 @@ void rotateLogFile() {
 
   if (logFile) logFile.close();
   char filename[32];
-  snprintf(filename, sizeof(filename), "/log_%lu.tmp", currentLogIndex);
+  snprintf(filename, sizeof(filename), "/log_%lu.tmp", (unsigned long)currentLogIndex);
 
   logFile = SD.open(filename, FILE_WRITE);
   if (!logFile) {
@@ -52,7 +52,7 @@ void rotatePcapFile() {
 
   if (pcapFile) pcapFile.close();
   char filename[32];
-  snprintf(filename, sizeof(filename), "/capture_%lu.pcap", currentPcapIndex++);
+  snprintf(filename, sizeof(filename), "/capture_%lu.pcap", (unsigned long)currentPcapIndex++);
 
   pcapFile = SD.open(filename, FILE_WRITE);
   if (!pcapFile) {
@@ -97,8 +97,8 @@ void loadOuiDatabase() {
   while (ouiFile.available() && ouiCount < MAX_OUI_ENTRIES) {
     ouiFile.readBytesUntil('\n', line, 128);
     if (strlen(line) < 8) continue;
-    char oui[8], vendor[64];
-    if (sscanf(line, "%[^,],%[^,]", oui, vendor) == 2) { strncpy(ouiDatabase[ouiCount].oui, oui, 7); strncpy(ouiDatabase[ouiCount].vendor, vendor, 63); ouiCount++; }
+    char oui[9], vendor[64];
+    if (sscanf(line, "%[^,],%[^,]", oui, vendor) == 2) { strncpy(ouiDatabase[ouiCount].oui, oui, 8); ouiDatabase[ouiCount].oui[8] = '\0'; strncpy(ouiDatabase[ouiCount].vendor, vendor, 63); ouiCount++; }
   }
   ouiFile.close(); ouiLoaded = true;
 }
@@ -131,8 +131,8 @@ void loadVendorAliases() {
   while (vendorAliasFile.available() && aliasCount < 100) {
     vendorAliasFile.readBytesUntil('\n', line, 128);
     if (strlen(line) < 8) continue;
-    char oui[8], alias[64];
-    if (sscanf(line, "%[^,],%[^,]", oui, alias) == 2) { strncpy(vendorAliases[aliasCount].oui, oui, 7); strncpy(vendorAliases[aliasCount].alias, alias, 63); aliasCount++; }
+    char oui[9], alias[64];
+    if (sscanf(line, "%[^,],%[^,]", oui, alias) == 2) { strncpy(vendorAliases[aliasCount].oui, oui, 8); ouiDatabase[ouiCount].oui[8] = '\0'; strncpy(vendorAliases[aliasCount].alias, alias, 63); aliasCount++; }
   }
   vendorAliasFile.close();
 }
