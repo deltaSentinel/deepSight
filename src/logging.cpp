@@ -143,19 +143,24 @@ void logWriterTask(void* param) {
   rotateLogFile();
   if (!sdInitialized) {
     Serial.println("Log Task: SD not ready. Exiting.");
-    vTaskDelete(NULL); // Kill this task to save memory
+    vTaskDelete(NULL);
     return;
   }
   LogMessage batch[LOG_BATCH_SIZE]; int batchCount = 0; unsigned long lastFlush = millis();
   while (true) {
     LogMessage msg;
-    if (xQueueReceive(logQueue, &msg, pdMS_TO_TICKS(100)) == pdTRUE) { batch[batchCount++] = msg; }
+    if (batchCount < LOG_BATCH_SIZE &&
+        xQueueReceive(logQueue, &msg, pdMS_TO_TICKS(100)) == pdTRUE) {
+      batch[batchCount++] = msg;
+    }
     bool flushNow = (batchCount >= LOG_BATCH_SIZE) || (millis() - lastFlush > LOG_FLUSH_INTERVAL);
     if (!flushNow) continue;
-    if (!logFile) continue;
-    for (int i = 0; i < batchCount; i++) { logFile.println(batch[i].text); }
+    int n = batchCount;
+    batchCount = 0;
+    lastFlush = millis();
+    if (!logFile) continue; // batch dropped, not corrupted
+    for (int i = 0; i < n; i++) { logFile.println(batch[i].text); }
     logFile.flush();
-    batchCount = 0; lastFlush = millis();
     if (logFile.size() > LOG_ROTATE_SIZE) {
       logFile.close();
       String oldName = "/log_" + String(currentLogIndex) + ".tmp";
@@ -168,19 +173,30 @@ void logWriterTask(void* param) {
 
 void pcapWriterTask(void* param) {
   rotatePcapFile();
+  if (!sdInitialized) {
+    Serial.println("PCAP Task: SD not ready. Exiting.");
+    vTaskDelete(NULL);
+    return;
+  }
   PcapPacket batch[PCAP_BATCH_SIZE]; int batchCount = 0; unsigned long lastFlush = millis();
   while (true) {
     PcapPacket pkt;
-    if (xQueueReceive(pcapQueue, &pkt, pdMS_TO_TICKS(100)) == pdTRUE) { batch[batchCount++] = pkt; }
+    if (batchCount < PCAP_BATCH_SIZE &&
+        xQueueReceive(pcapQueue, &pkt, pdMS_TO_TICKS(100)) == pdTRUE) {
+      batch[batchCount++] = pkt;
+    }
     bool flushNow = (batchCount >= PCAP_BATCH_SIZE) || (millis() - lastFlush > PCAP_FLUSH_INTERVAL);
     if (!flushNow) continue;
-    if (!pcapFile) continue;
-    for (int i = 0; i < batchCount; i++) {
+    int n = batchCount;
+    batchCount = 0;
+    lastFlush = millis();
+    if (!pcapFile) continue; // batch dropped, not corrupted
+    for (int i = 0; i < n; i++) {
       struct PcapPacketHeader { uint32_t ts_sec; uint32_t ts_usec; uint32_t incl_len; uint32_t orig_len; } hdr = {batch[i].timestampSec, batch[i].timestampUSec, batch[i].length, batch[i].length};
       pcapFile.write((uint8_t*)&hdr, sizeof(hdr));
       pcapFile.write(batch[i].payload, batch[i].length);
     }
-    pcapFile.flush(); batchCount = 0; lastFlush = millis();
+    pcapFile.flush();
     if (pcapFile.size() > PCAP_ROTATE_SIZE) rotatePcapFile();
   }
 }
