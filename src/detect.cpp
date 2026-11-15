@@ -11,7 +11,7 @@
 
 const char* getVendorFromOui(const uint8_t* mac) {
   char ouiStr[8];
-  snprintf(ouiStr, 8, "%02X:%02X:%02X", mac[0], mac[1], mac[2]);
+  snprintf(ouiStr, 9, "%02X:%02X:%02X", mac[0], mac[1], mac[2]);
   for (int i = 0; i < aliasCount; i++)
     if (strcmp(vendorAliases[i].oui, ouiStr) == 0) return vendorAliases[i].alias;
   for (int i = 0; i < ouiCount; i++)
@@ -396,7 +396,8 @@ int calculateThreatScore(AccessPoint* ap) {
   if (strcmp(ap->tag, "Enterprise") == 0) score += 5;
   if (ap->isWPA3Transition) score += 15; // Transition mode is risky
   if (ap->wpsPin > 0) score += 25; // Exposed WPS PIN
-  if (score < 0) score = 0; if (score > 100) score = 100;
+  if (score < 0) { score = 0; }
+  if (score > 100) { score = 100; }
   return score;
 }
 
@@ -508,7 +509,7 @@ void exportHandshake(const uint8_t* bssid, const uint8_t* payload, int len) {
 
   struct PcapGlobalHeader { uint32_t magic_number; uint16_t version_major; uint16_t version_minor; int32_t thiszone; uint32_t sigfigs; uint32_t snaplen; uint32_t network; } hdr = {0xA1B2C3D4, 2, 4, 0, 0, MAX_PACKET_SIZE, 105};
   hsFile.write((uint8_t*)&hdr, sizeof(hdr));
-  struct PcapPacketHeader { uint32_t ts_sec; uint32_t ts_usec; uint32_t incl_len; uint32_t orig_len; } phdr = {millis()/1000, (millis()%1000)*1000, len, len};
+  struct PcapPacketHeader { uint32_t ts_sec; uint32_t ts_usec; uint32_t incl_len; uint32_t orig_len; } phdr = {millis()/1000, (millis()%1000)*1000, (uint32_t)len, (uint32_t)len};
   hsFile.write((uint8_t*)&phdr, sizeof(phdr));
   hsFile.write(payload, len);
   hsFile.flush(); hsFile.close();

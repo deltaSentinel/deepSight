@@ -16,7 +16,7 @@ void enqueueLog(const char* type, const char* event, const char* data, int rssi,
   else snprintf(gpsStr, sizeof(gpsStr), "0.000000,0.000000,0.00,0");
   char timestamp[32]; getTimestamp(timestamp, sizeof(timestamp));
   snprintf(msg.text, sizeof(msg.text), "%s,%s,%s,%s,%d,%d,%s,UNKNOWN,0.00,0,UNK,UNK,0,0,General", timestamp, type, event, data, rssi, channel, gpsStr);
-  if (xQueueSend(logQueue, &msg, 0) != pdTRUE) queueOverflowCount++;
+  if (xQueueSend(logQueue, &msg, 0) != pdTRUE) queueOverflowCount = queueOverflowCount + 1;
 }
 
 void enqueueLogAP(const char* type, const char* event, const char* data, int rssi, int channel, float bw, int clients, const char* cipher, const char* auth, bool rand, int threat, const char* tag) {
@@ -30,7 +30,7 @@ void enqueueLogAP(const char* type, const char* event, const char* data, int rss
   else snprintf(gpsStr, sizeof(gpsStr), "0.000000,0.000000,0.00,0");
   char timestamp[32]; getTimestamp(timestamp, sizeof(timestamp));
   snprintf(msg.text, sizeof(msg.text), "%s,%s,%s,%s,%d,%d,%s,%.2f,%d,%s,%s,%d,%d,%s", timestamp, type, event, data, rssi, channel, gpsStr, bw, clients, cipher, auth, rand ? 1 : 0, threat, tag);
-  if (xQueueSend(logQueue, &msg, 0) != pdTRUE) queueOverflowCount++;
+  if (xQueueSend(logQueue, &msg, 0) != pdTRUE) queueOverflowCount = queueOverflowCount + 1;
 }
 
 void enqueuePcap(const uint8_t* payload, uint16_t length) {
@@ -38,7 +38,7 @@ void enqueuePcap(const uint8_t* payload, uint16_t length) {
   PcapPacket pkt;
   memcpy(pkt.payload, payload, length); pkt.length = length;
   pkt.timestampSec = millis() / 1000; pkt.timestampUSec = (millis() % 1000) * 1000;
-  if (xQueueSend(pcapQueue, &pkt, 0) != pdTRUE) queueOverflowCount++;
+  if (xQueueSend(pcapQueue, &pkt, 0) != pdTRUE) queueOverflowCount = queueOverflowCount + 1;
 }
 
 void generateKML() {

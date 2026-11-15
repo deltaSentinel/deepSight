@@ -1,11 +1,6 @@
 // ===================== helpers.cpp =====================
 #include "helpers.h"
-
-bool macEqual(const uint8_t* a, const uint8_t* b) { return memcmp(a, b, 6) == 0; }
-bool isBroadcast(const uint8_t* mac) { for (int i = 0; i < 6; i++) if (mac[i] != 0xFF) return false; return true; }
-bool isMulticast(const uint8_t* mac) { return (mac[0] & 0x01) == 0x01; }
-
-void getOui(const uint8_t* mac, char* ouiStr) { snprintf(ouiStr, 9, "%02X:%02X:%02X", mac[0], mac[1], mac[2]); }
+#include "pure_utils.h"
 
 void getTimestamp(char* buffer, size_t size) {
   if (rtcFound) {
@@ -34,7 +29,7 @@ PacketBuffer* allocPacketBuffer() {
   for (int i = 0; i < PACKET_POOL_SIZE; i++) {
     if (!packetPool[i].used) { packetPool[i].used = true; return &packetPool[i]; }
   }
-  packetDropCount++; return nullptr;
+  packetDropCount = packetDropCount + 1; return nullptr;
 }
 void freePacketBuffer(PacketBuffer* pkt) { if (!pkt) return; pkt->used = false; }
 

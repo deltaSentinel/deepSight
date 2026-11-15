@@ -30,7 +30,7 @@ void installPromiscuousMode() {
     }
 
     if (!pkt) {
-      packetDropCount++;
+      packetDropCount = packetDropCount + 1;
       return;
     }
 
@@ -46,7 +46,7 @@ void installPromiscuousMode() {
     BaseType_t res = xQueueSend(packetQueue, &pkt, 0);
     if (res != pdTRUE) {
       pkt->used = false;
-      packetDropCount++;
+      packetDropCount = packetDropCount + 1;
     }
   });
 
@@ -307,7 +307,7 @@ void packetProcessorTask(void* param) {
       }
 
       freePacketBuffer(pkt);
-      totalPacketsProcessed++;
+      totalPacketsProcessed = totalPacketsProcessed + 1;
     }
   }
 }

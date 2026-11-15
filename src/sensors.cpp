@@ -9,11 +9,11 @@
 // CHANNEL HOPPING
 // ======================================================
 
-void updateChannelActivity() { channelActivityCount++; lastPacketTime = millis(); }
+void updateChannelActivity() { channelActivityCount = channelActivityCount + 1; lastPacketTime = millis(); }
 
 void forceHop() {
   xSemaphoreTake(channelMutex, portMAX_DELAY);
-  currentChannel++;
+  currentChannel = currentChannel + 1;
   if (currentChannel > WIFI_CHANNEL_END) currentChannel = WIFI_CHANNEL_START;
   esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
   channelActivityCount = 0; lastChannelSwitch = millis();
@@ -29,7 +29,7 @@ void handleChannelHopping() {
   if (batterySaverMode) currentDwellTime = BATTERY_SAVER_DWELL;
 
   xSemaphoreTake(channelMutex, portMAX_DELAY);
-  currentChannel++;
+  currentChannel = currentChannel + 1;
   if (currentChannel > WIFI_CHANNEL_END) currentChannel = WIFI_CHANNEL_START;
   esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
   channelActivityCount = 0; lastChannelSwitch = millis();
@@ -80,7 +80,7 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
     else { memset(mac, 0, 6); }
     char uuid[37] = ""; uint16_t major = 0, minor = 0; bool isRandomized = false;
     if (manuf.length() >= 25 && manuf[0] == 0x4C && manuf[1] == 0x00) {
-      snprintf(uuid, 36, "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+      snprintf(uuid, 37, "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
                manuf[2], manuf[3], manuf[4], manuf[5], manuf[6], manuf[7], manuf[8], manuf[9],
                manuf[10], manuf[11], manuf[12], manuf[13], manuf[14], manuf[15], manuf[16], manuf[17]);
       major = manuf[18] | (manuf[19] << 8); minor = manuf[20] | (manuf[21] << 8);

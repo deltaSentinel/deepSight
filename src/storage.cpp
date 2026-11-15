@@ -146,18 +146,23 @@ void loadFingerprints() {
   while (fpFile.available() && fpCount < MAX_FINGERPRINTS) {
     fpFile.readBytesUntil('\n', line, 200);
     if (strlen(line) < 10) continue;
-    char id[33], oui[9], ssid[33]; int rssi, ch, hs, ts, wps, nf; float bw, util; int cc; bool rand, trans;
+    char id[33], oui[9], ssid[33];
+    int rssi, ch, hs, ts, wps, nf, cc; float bw, util;
+    int tRand, tTrans;
     char ciph[8] = "UNK", auth[8] = "UNK", tag[16] = "General";
     // Extended format with new fields
     if (sscanf(line, "%[^,],%[^,],%[^,],%d,%d,%d,%f,%d,%d,%d,%d,%d,%d,%f,%[^,],%[^,],%d,%[^,]",
-               id, oui, ssid, &rssi, &ch, &hs, &bw, &cc, &rand, &wps, &nf, &ts, &trans, &util, ciph, auth, &ts, tag) >= 16) {}
-    else if (sscanf(line, "%[^,],%[^,],%[^,],%d,%d,%d", id, oui, ssid, &rssi, &ch, &hs) == 6) { ts = 0; wps = 0; nf = 0; trans = false; util = 0; }
+               id, oui, ssid, &rssi, &ch, &hs, &bw, &cc, &tRand, &wps, &nf, &ts, &tTrans, &util, ciph, auth, &ts, tag) >= 16) {
+    fpDB[fpCount].isRandomized = (tRand != 0);
+    fpDB[fpCount].isWPA3Transition = (tTrans != 0);
+    }
+    else if (sscanf(line, "%[^,],%[^,],%[^,],%d,%d,%d", id, oui, ssid, &rssi, &ch, &hs) == 6) { ts = 0; wps = 0; nf = 0; tTrans = 0; util = 0; bw = 0; cc = 0; tRand = 0; }
     else continue;
     strncpy(fpDB[fpCount].id, id, 32); strncpy(fpDB[fpCount].oui, oui, 8); strncpy(fpDB[fpCount].ssid, ssid, 32);
     fpDB[fpCount].avgRssi = rssi; fpDB[fpCount].lastChannel = ch; fpDB[fpCount].handshakeCount = hs;
     fpDB[fpCount].active = true; fpDB[fpCount].isWPA3 = false; fpDB[fpCount].isWifi6 = false; fpDB[fpCount].isMesh = false;
-    fpDB[fpCount].bandwidthMbps = bw; fpDB[fpCount].clientCount = cc; fpDB[fpCount].isRandomized = rand;
-    fpDB[fpCount].wpsPin = wps; fpDB[fpCount].noiseFloor = nf; fpDB[fpCount].isWPA3Transition = trans; fpDB[fpCount].airtimeUtil = util;
+    fpDB[fpCount].bandwidthMbps = bw; fpDB[fpCount].clientCount = cc; fpDB[fpCount].isRandomized = tRand;
+    fpDB[fpCount].wpsPin = wps; fpDB[fpCount].noiseFloor = nf; fpDB[fpCount].isWPA3Transition = tTrans; fpDB[fpCount].airtimeUtil = util;
     strncpy(fpDB[fpCount].cipherSuite, ciph, 7); strncpy(fpDB[fpCount].authMode, auth, 7);
     fpDB[fpCount].threatScore = ts; strncpy(fpDB[fpCount].tag, tag, 15);
     fpCount++;
