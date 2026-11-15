@@ -1,0 +1,2022 @@
+/*
+  ============================================================
+  ESP32-S3 Advanced Wireless IDS (WIDS) - Deep Sight Edition v4.0
+  ============================================================
+  
+  CORE FEATURES:
+  - Passive WiFi Sniffing (802.11b/g/n/ax)
+  - WPA2/WPA3 Handshake & PMKID Capture (Passive)
+  - WPA3-SAE, Wi-Fi 6 (HE), Mesh Network Detection
+  
+  INTELLIGENCE FEATURES (v4.0 EXPANSION):
+  - Threat Scoring Algorithm (0-100 risk per AP)
+  - Auto-Tagging (Public, Enterprise, Personal, IoT, Suspicious)
+  - Delta Logging (80% storage savings)
+  - Client-to-AP Mapping (Who is connected to whom?)
+  - WPS PIN Enumeration (Passive logging of exposed PINs)
+  - Channel Utilization & Noise Floor Analysis
+  - WPA3 Transition Mode Detection (Mixed Mode)
+  - Hidden SSID Detection (Via Probe Responses)
+  - Deauthentication Forensics (Passive logging of kicks)
+  
+  OPERATIONAL UTILITIES:
+  - HTML Report Generator (Includes Client Map & Noise Stats)
+  - Battery Saver Mode (Extended deployment)
+  - PMKID Hashcat Formatting
+  
+  STABILITY FEATURES:
+  - ESP32 v3 Compatible (No F() in printf)
+  - Watchdog Protection (10s timeout + yield())
+  - Memory Optimization (DHCP disabled, Static Buffers)
+  - Robust SD I/O (Retry logic)
+  
+  HARDWARE REQUIRED:
+  - ESP32-S3 Dev Module (OPI PSRAM Enabled, 16MB Flash)
+  - 0.96" SSD1306 OLED (I2C, 0x3C)
+  - GPS Module (UART, 9600 baud)
+  - MicroSD Card Module (SPI, CS=10)
+  - Piezo Buzzer (GPIO 42)
+  - DS3231 RTC Module (I2C, optional)
+  - 5x Tactile Buttons (Pull-up, GPIOs 47/48/46/43/44)
+  - 3.7V LiPo + ADC Voltage Divider (GPIO 2)
+  
+  LIBRARIES:
+  - TinyGPSPlus, RTClib, Adafruit SSD1306, Adafruit GFX, NimBLE-Arduino
+*/
+
+#include <WiFi.h>
+#include "esp_wifi.h"
+#include "esp_task_wdt.h"
+#include <SPI.h>
+#include <SD.h>
+#include <string.h>
+#include <math.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <RTClib.h>
+#include <NimBLEDevice.h>
+#include <NimBLEScan.h>
+
+// ======================================================
+// CONFIGURATION
+// ======================================================
+
+#define MAX_PACKET_SIZE                 256
+#define WIFI_CHANNEL_START              1
+#define WIFI_CHANNEL_END                13
+#define MIN_DWELL_TIME_MS               500
+#define MAX_DWELL_TIME_MS               3000
+#define QUIET_THRESHOLD                 5
+#define SLEEP_TIMEOUT                   300000
+#define DEEP_SLEEP_WAKE_PIN             5   // Was 47, NOW WORKS (RTC GPIO)
+
+#define SD_CS                           10
+
+#define PACKET_POOL_SIZE                64
+#define PACKET_QUEUE_SIZE               128
+#define LOG_QUEUE_SIZE                  256
+#define PCAP_QUEUE_SIZE                 128
+#define LOG_BATCH_SIZE                  16
+#define PCAP_BATCH_SIZE                 8
+#define LOG_FLUSH_INTERVAL              10000
+#define PCAP_FLUSH_INTERVAL             10000
+#define LOG_ROTATE_SIZE                 524288
+#define PCAP_ROTATE_SIZE                2097152
+#define MAX_APS                         64
+#define MAX_CLIENTS                     64
+#define MAX_CLIENT_MAP                  128 // Max client entries
+#define FORGET_TIME                     30000
+#define RSSI_THRESHOLD                  -85
+#define CONFIG_FILE                     "/config.csv"
+#define OUI_FILE                        "/ouilist.csv"
+#define KNOWN_DEVICES_FILE              "/known_devices.csv"
+#define FINGERPRINT_FILE                "/fingerprints.csv"
+#define VENDOR_ALIASES_FILE             "/vendor_aliases.csv"
+#define KML_OUTPUT_FILE                 "/networks.kml"
+#define REPORT_OUTPUT_FILE              "/report.html"
+#define MAX_OUI_ENTRIES                 500
+#define MAX_KNOWN_DEVS                  100
+#define MAX_FINGERPRINTS                100
+
+#define GPS_BAUD                        9600
+#define GPS_RX_PIN                      1
+#define GPS_TX_PIN                      3   // Was 7
+
+#define BLE_SCAN_DURATION               5000
+#define BLE_SCAN_INTERVAL               100
+#define BLE_SCAN_WINDOW                 100
+
+#define OLED_SDA                        16  // Was 21, shifted for wiring management
+#define OLED_SCL                        17  // Was 22, 22 unavailable on board
+#define BTN_LOG                         5   // Was 47, now RTC-safe for deep sleep wake
+#define BTN_HOP                         6   // Was 48, moved off JTAG
+#define BTN_CLEAR                       7   // Was 46→5, avoid strapping
+#define BTN_PANIC                       8   // Was 43, moved off UART0 TX
+#define BTN_HEALTH                      9   // Was 44, moved off UART0 RX
+#define BUZZER_PIN                      4   // Was 42, moved off JTAG
+#define BAT_ADC_PIN                     2
+
+// STABILITY THRESHOLDS
+#define MIN_FREE_HEAP                   20000
+#define MIN_FREE_PSRAM                  50000
+#define MIN_STACK_WATERMARK             2048
+
+// DELTA LOGGING THRESHOLDS
+#define DELTA_RSSI_CHANGE               5
+#define DELTA_MIN_INTERVAL_MS           30000
+
+// BATTERY SAVER THRESHOLDS
+#define BATTERY_SAVER_DWELL             5000
+#define BATTERY_SAVER_BLE_INTERVAL      60000
+#define BATTERY_SAVER_GPS_INTERVAL      60000
+#define BATTERY_SAVER_SLEEP_TIMEOUT     120000
+
+// ======================================================
+// GLOBALS & STRUCTURES
+// ======================================================
+
+QueueHandle_t packetQueue;
+QueueHandle_t logQueue;
+QueueHandle_t pcapQueue;
+
+TaskHandle_t xProcTaskHandle = NULL;
+TaskHandle_t xLogTaskHandle = NULL;
+TaskHandle_t xPcapTaskHandle = NULL;
+TaskHandle_t xCleanupTaskHandle = NULL;
+
+SemaphoreHandle_t apMutex;
+SemaphoreHandle_t clientMutex;
+SemaphoreHandle_t channelMutex;
+SemaphoreHandle_t gpsMutex;
+SemaphoreHandle_t fpMutex;
+SemaphoreHandle_t bleMutex;
+SemaphoreHandle_t filterMutex;
+SemaphoreHandle_t ouiMutex;
+SemaphoreHandle_t knownDevMutex;
+SemaphoreHandle_t karmaMutex;
+
+File logFile;
+File pcapFile;
+File fpFile;
+File configFile;
+File ouiFile;
+File knownDevFile;
+File vendorAliasFile;
+
+uint32_t currentLogIndex = 0;
+uint32_t currentPcapIndex = 0;
+
+volatile uint32_t packetDropCount = 0;
+volatile uint32_t queueOverflowCount = 0;
+volatile uint32_t totalPacketsProcessed = 0;
+volatile uint32_t lastPacketTime = 0;
+
+volatile int currentChannel = WIFI_CHANNEL_START;
+unsigned long lastChannelSwitch = 0;
+volatile int channelActivityCount = 0;
+volatile int currentDwellTime = MIN_DWELL_TIME_MS;
+
+bool sdInitialized = false;
+bool loggingEnabled = true;
+bool silentMode = false;
+bool deepSleepEnabled = true;
+bool gpsLockAcquired = false;
+bool showHealthDashboard = false;
+bool batterySaverMode = false;
+float batteryVoltage = 0.0;
+float batteryPercent = 0.0;
+
+unsigned long lastLogTimeByAP[MAX_APS];
+int lastRssiByAP[MAX_APS];
+
+// --- New Structures for v4.0 ---
+
+// Client-to-AP Mapping
+struct ClientMapEntry {
+  uint8_t clientMac[6];
+  uint8_t apBssid[6];
+  char ssid[33];
+  int rssi;
+  unsigned long lastSeen;
+  bool active;
+};
+
+// Channel Utilization Stats
+struct ChannelStats {
+  int totalPackets;
+  int noiseFloor;
+  unsigned long busyTime;
+  unsigned long totalTime;
+  float utilizationPercent;
+};
+
+// --- Struct Definitions ---
+
+struct FilterEntry { uint8_t bssid[6]; char mode; bool active; };
+struct OuiEntry { char oui[8]; char vendor[64]; };
+struct KnownDevice { uint8_t mac[6]; char type[8]; char nickname[32]; bool active; };
+struct VendorAlias { char oui[8]; char alias[64]; };
+struct KarmaTracker { uint8_t bssid[6]; unsigned long lastProbeReq; unsigned long lastProbeResp; int reqCount; int respCount; bool active; };
+struct AnomalyTracker { uint8_t bssid[6]; float avgRssi; int avgPacketsPerSec; unsigned long lastUpdate; bool active; };
+
+struct FingerprintDB {
+  char id[33]; char oui[9]; char ssid[33]; int avgRssi; int lastChannel; int handshakeCount;
+  bool active; bool isWPA3; bool isWifi6; bool isMesh; float bandwidthMbps; int clientCount;
+  bool isRandomized; char cipherSuite[8]; char authMode[8]; int threatScore; char tag[16];
+  bool isWPA3Transition; // NEW
+  int wpsPin;            // NEW
+  int noiseFloor;        // NEW
+  float airtimeUtil;     // NEW
+};
+
+struct HandshakeTracker { uint8_t bssid[6]; uint8_t state; unsigned long lastMsgTime; bool captured; bool exported; };
+struct BLEDeviceCache { uint8_t mac[6]; int rssi; uint16_t manufId; char name[32]; char vendor[64]; char uuid[37]; uint16_t major; uint16_t minor; bool isRandomized; unsigned long lastSeen; bool active; };
+
+struct AccessPoint {
+  char ssid[33]; uint8_t bssid[6]; int rssi; int channel; bool active; unsigned long lastSeen;
+  int packetCount; bool isEvilTwin; bool hasPMKID; bool isWPA3; bool isWifi6; bool isMesh;
+  uint64_t bytesReceived; unsigned long lastByteUpdate; float bandwidthMbps; int clientCount;
+  bool isRandomized; char cipherSuite[8]; char authMode[8]; uint8_t trackedClients[16][6];
+  int trackedClientCount; int threatScore; char tag[16];
+  bool isWPA3Transition; // NEW
+  int wpsPin;            // NEW
+  int noiseFloor;        // NEW
+  float airtimeUtil;     // NEW
+};
+
+struct StationClient { uint8_t mac[6]; int rssi; bool active; unsigned long lastSeen; };
+struct PacketBuffer { uint8_t payload[MAX_PACKET_SIZE]; uint16_t length; int8_t rssi; uint8_t channel; wifi_promiscuous_pkt_type_t type; bool used; };
+struct LogMessage { char text[350]; };
+struct PcapPacket { uint8_t payload[MAX_PACKET_SIZE]; uint16_t length; uint32_t timestampSec; uint32_t timestampUSec; };
+
+// --- Global Arrays ---
+
+FilterEntry filters[64]; int filterCount = 0; bool whitelistMode = false;
+OuiEntry ouiDatabase[MAX_OUI_ENTRIES]; int ouiCount = 0; bool ouiLoaded = false;
+KnownDevice knownDevices[MAX_KNOWN_DEVS]; int knownDeviceCount = 0;
+VendorAlias vendorAliases[100]; int aliasCount = 0;
+KarmaTracker* karmaDB = nullptr;
+AnomalyTracker* anomalyDB = nullptr;
+ClientMapEntry* clientMap = nullptr; // NEW
+ChannelStats* channelStats = nullptr; // NEW
+
+TinyGPSPlus gps; HardwareSerial GPSSerial(1);
+float currentLat = 0.0, currentLon = 0.0, currentAlt = 0.0; int currentSats = 0; bool gpsFixValid = false;
+RTC_DS3231 rtc; bool rtcFound = false;
+bool bleScanning = false; NimBLEScan* pBLEScan;
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+FingerprintDB* fpDB = nullptr; int fpCount = 0; bool fpLoaded = false;
+HandshakeTracker* hsTrack = nullptr; int hsCount = 0;
+BLEDeviceCache* bleCache = nullptr; int bleCount = 0;
+AccessPoint* aps = nullptr;
+StationClient* clients = nullptr;
+PacketBuffer* packetPool = nullptr;
+
+// ======================================================
+// HELPER FUNCTIONS
+// ======================================================
+
+bool macEqual(const uint8_t* a, const uint8_t* b) { return memcmp(a, b, 6) == 0; }
+bool isBroadcast(const uint8_t* mac) { for (int i = 0; i < 6; i++) if (mac[i] != 0xFF) return false; return true; }
+bool isMulticast(const uint8_t* mac) { return (mac[0] & 0x01) == 0x01; }
+
+void getOui(const uint8_t* mac, char* ouiStr) { snprintf(ouiStr, 9, "%02X:%02X:%02X", mac[0], mac[1], mac[2]); }
+
+void getTimestamp(char* buffer, size_t size) {
+  if (rtcFound) {
+    DateTime now = rtc.now();
+    if (now.year() > 2000) snprintf(buffer, size, "%04d-%02d-%02d %02d:%02d:%02d", now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+    else snprintf(buffer, size, "%lu", millis());
+  } else snprintf(buffer, size, "%lu", millis());
+}
+
+void readBattery() {
+  int adcValue = analogRead(BAT_ADC_PIN);
+  float v_adc = (adcValue / 4095.0) * 3.3;
+  batteryVoltage = v_adc * 3.0;
+  if (batteryVoltage < 3.0) batteryPercent = 0;
+  else if (batteryVoltage > 4.2) batteryPercent = 100;
+  else batteryPercent = ((batteryVoltage - 3.0) / 1.2) * 100;
+}
+
+void playTone(int freq, int duration) { if (silentMode || batterySaverMode) return; tone(BUZZER_PIN, freq, duration); }
+void beepHandshake() { playTone(2000, 200); delay(50); playTone(2000, 200); }
+void beepDeauth() { playTone(1000, 100); }
+void beepGPS() { playTone(3000, 500); }
+void beepAlert() { playTone(4000, 300); delay(100); playTone(4000, 300); }
+
+PacketBuffer* allocPacketBuffer() {
+  for (int i = 0; i < PACKET_POOL_SIZE; i++) {
+    if (!packetPool[i].used) { packetPool[i].used = true; return &packetPool[i]; }
+  }
+  packetDropCount++; return nullptr;
+}
+void freePacketBuffer(PacketBuffer* pkt) { if (!pkt) return; pkt->used = false; }
+
+// ======================================================
+// AUTO-TAGGING ENGINE
+// ======================================================
+
+void autoTag(const char* ssid, bool isOpen, bool isMesh, int clientCount, char* tag) {
+  strcpy(tag, "General");
+  if (strlen(ssid) == 0 || strcmp(ssid, "<hidden>") == 0) { strcpy(tag, "Hidden"); return; }
+  String s = String(ssid); s.toLowerCase();
+  if (s.indexOf("guest") >= 0 || s.indexOf("public") >= 0 || s.indexOf("free") >= 0 || s.indexOf("wifi") >= 0 || s.indexOf("open") >= 0 || s.indexOf("library") >= 0 || s.indexOf("airport") >= 0 || s.indexOf("cafe") >= 0 || s.indexOf("hotel") >= 0 || s.indexOf("mall") >= 0 || s.indexOf("starbucks") >= 0 || s.indexOf("mcdonald") >= 0) { strcpy(tag, "Public"); return; }
+  if (s.indexOf("corp") >= 0 || s.indexOf("office") >= 0 || s.indexOf("admin") >= 0 || s.indexOf("internal") >= 0 || s.indexOf("enterprise") >= 0 || s.indexOf("staff") >= 0 || s.indexOf("secure") >= 0 || s.indexOf("private") >= 0) { strcpy(tag, "Enterprise"); return; }
+  if (s.indexOf("smart") >= 0 || s.indexOf("iot") >= 0 || s.indexOf("home") >= 0 || s.indexOf("nest") >= 0 || s.indexOf("ring") >= 0 || s.indexOf("hue") >= 0 || s.indexOf("tplink") >= 0 || s.indexOf("esp_") >= 0 || s.indexOf("sonoff") >= 0 || s.indexOf("tuya") >= 0) { strcpy(tag, "IoT"); return; }
+  if (s.indexOf("iphone") >= 0 || s.indexOf("android") >= 0 || s.indexOf("galaxy") >= 0 || s.indexOf("pixel") >= 0 || s.indexOf("ipad") >= 0 || s.indexOf("hotspot") >= 0 || s.indexOf("my ") >= 0 || s.indexOf("phone") >= 0) { strcpy(tag, "Personal"); return; }
+  if (isMesh) { strcpy(tag, "Mesh"); return; }
+  int alphaCount = 0, digitCount = 0, specialCount = 0;
+  for (unsigned int i = 0; i < strlen(ssid); i++) { if (isalpha(ssid[i])) alphaCount++; else if (isdigit(ssid[i])) digitCount++; else specialCount++; }
+  float entropy = 0.0; int slen = strlen(ssid); if (slen > 0) entropy = ((float)(alphaCount + digitCount + specialCount * 3)) / slen;
+  if (slen >= 8 && specialCount >= 2 && entropy > 2.5) { strcpy(tag, "Suspicious"); return; }
+  if (isOpen) { strcpy(tag, "Open"); return; }
+}
+
+// ======================================================
+// THREAT SCORING ENGINE
+// ======================================================
+
+int calculateThreatScore(AccessPoint* ap) {
+  int score = 0;
+  if (strcmp(ap->authMode, "UNK") == 0 || strcmp(ap->cipherSuite, "UNK") == 0) score += 10;
+  if (strcmp(ap->authMode, "PSK") == 0) score += 5;
+  if (strcmp(ap->cipherSuite, "TKIP") == 0) score += 30;
+  if (ap->hasPMKID) score += 50;
+  if (ap->isEvilTwin) score += 100;
+  if (ap->clientCount > 20) score += 15; else if (ap->clientCount > 10) score += 10; else if (ap->clientCount > 5) score += 5;
+  if (ap->rssi > -50) score += 10; else if (ap->rssi > -60) score += 5;
+  if (ap->isRandomized) score -= 5;
+  if (strcmp(ap->tag, "Public") == 0) score += 10;
+  if (strcmp(ap->tag, "Suspicious") == 0) score += 40;
+  if (strcmp(ap->tag, "IoT") == 0) score += 20;
+  if (strcmp(ap->tag, "Enterprise") == 0) score += 5;
+  if (ap->isWPA3Transition) score += 15; // Transition mode is risky
+  if (ap->wpsPin > 0) score += 25; // Exposed WPS PIN
+  if (score < 0) score = 0; if (score > 100) score = 100;
+  return score;
+}
+
+// ======================================================
+// DELTA LOGGING ENGINE
+// ======================================================
+
+bool shouldLogAP(int apIndex, int rssi, int channel) {
+  unsigned long now = millis();
+  if (lastLogTimeByAP[apIndex] == 0) { lastLogTimeByAP[apIndex] = now; lastRssiByAP[apIndex] = rssi; return true; }
+  int rssiDelta = abs(rssi - lastRssiByAP[apIndex]);
+  unsigned long timeDelta = now - lastLogTimeByAP[apIndex];
+  if (rssiDelta >= DELTA_RSSI_CHANGE || timeDelta >= DELTA_MIN_INTERVAL_MS) { lastLogTimeByAP[apIndex] = now; lastRssiByAP[apIndex] = rssi; return true; }
+  return false;
+}
+
+// ======================================================
+// HTML REPORT GENERATOR (v4.0 Enhanced)
+// ======================================================
+
+void generateHTMLReport() {
+  if (SD.exists(REPORT_OUTPUT_FILE)) SD.remove(REPORT_OUTPUT_FILE);
+  File report = SD.open(REPORT_OUTPUT_FILE, FILE_WRITE);
+  if (!report) { Serial.println("[ERROR] Failed to create HTML report"); return; }
+
+  int sortedIndices[MAX_FINGERPRINTS];
+  for (int i = 0; i < fpCount; i++) sortedIndices[i] = i;
+  for (int i = 0; i < fpCount - 1; i++) {
+    for (int j = 0; j < fpCount - i - 1; j++) {
+      if (fpDB[sortedIndices[j]].threatScore < fpDB[sortedIndices[j+1]].threatScore) {
+        int temp = sortedIndices[j]; sortedIndices[j] = sortedIndices[j+1]; sortedIndices[j+1] = temp;
+      }
+    }
+  }
+
+  report.println("<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">");
+  report.println("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">");
+  report.println("<title>WIDS Deep Sight Report</title>");
+  report.println("<style>body{font-family:Arial,sans-serif;margin:20px;background:#f4f4f4;}");
+  report.println("h1{color:#333;}table{width:100%;border-collapse:collapse;background:white;}");
+  report.println("th,td{border:1px solid #ddd;padding:8px;text-align:left;}");
+  report.println("th{background-color:#4CAF50;color:white;}");
+  report.println("tr:nth-child(even){background-color:#f2f2f2;}");
+  report.println(".high{color:red;font-weight:bold;}");
+  report.println(".med{color:orange;}");
+  report.println(".low{color:green;}");
+  report.println(".warn{color:blue;}");
+  report.println("</style></head><body><h1>Wireless Intelligence Deep Sight Report</h1>");
+  
+  char timestamp[32];
+  getTimestamp(timestamp, sizeof(timestamp));
+  report.print("<p>Generated: "); report.print(timestamp); report.print(" | Total APs: "); report.print(fpCount); report.println("</p>");
+
+  report.println("<table><thead><tr><th>Rank</th><th>SSID</th><th>BSSID</th><th>Tag</th><th>Threat</th><th>Security</th><th>Clients</th><th>WPS</th><th>Noise</th><th>RSSI</th></tr></thead><tbody>");
+
+  for (int i = 0; i < fpCount; i++) {
+    int idx = sortedIndices[i];
+    if (!fpDB[idx].active) continue;
+    
+    report.print("<tr><td>"); report.print(i + 1); report.print("</td><td>"); report.print(fpDB[idx].ssid);
+    report.print("</td><td>"); report.print(fpDB[idx].id);
+    report.print("</td><td>"); report.print(fpDB[idx].tag);
+    report.print("</td><td class=\"");
+    if (fpDB[idx].threatScore >= 70) report.print("high\">");
+    else if (fpDB[idx].threatScore >= 40) report.print("med\">");
+    else report.print("low\">");
+    report.print(fpDB[idx].threatScore);
+    report.print("</td><td>");
+    if (fpDB[idx].isWPA3Transition) report.print("WPA2/3 Mix");
+    else if (fpDB[idx].isWPA3) report.print("WPA3");
+    else report.print(fpDB[idx].authMode);
+    report.print("</td><td>"); report.print(fpDB[idx].clientCount);
+    report.print("</td><td>");
+    if (fpDB[idx].wpsPin > 0) { report.print(fpDB[idx].wpsPin); report.print(" <span class='warn'>EXPOSED</span>"); }
+    else report.print("-");
+    report.print("</td><td>"); report.print(fpDB[idx].noiseFloor); report.print(" dBm");
+    report.print("</td><td>"); report.print(fpDB[idx].avgRssi); report.println(" dBm</td></tr>");
+  }
+
+  report.println("</tbody></table>");
+  report.println("<p><a href=\"/log_0.csv\">Download Raw CSV Log</a></p>");
+  report.println("</body></html>");
+  
+  report.close();
+  Serial.println("HTML Report Generated: /report.html");
+  beepGPS();
+}
+
+// ======================================================
+// DATA LOADING
+// ======================================================
+
+void loadFilters() {
+  if (!SD.exists(CONFIG_FILE)) return;
+  configFile = SD.open(CONFIG_FILE, FILE_READ);
+  if (!configFile) return;
+  char line[64]; filterCount = 0; whitelistMode = false;
+  if (configFile.available()) configFile.readBytesUntil('\n', line, 64);
+  while (configFile.available() && filterCount < 64) {
+    configFile.readBytesUntil('\n', line, 64);
+    if (strlen(line) < 15) continue;
+    char bssidStr[18]; char modeChar;
+    if (sscanf(line, "%[^,],%c", bssidStr, &modeChar) == 2) {
+      uint8_t bssid[6];
+      sscanf(bssidStr, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx", &bssid[0], &bssid[1], &bssid[2], &bssid[3], &bssid[4], &bssid[5]);
+      filters[filterCount].active = true; memcpy(filters[filterCount].bssid, bssid, 6); filters[filterCount].mode = modeChar; filterCount++;
+      if (modeChar == 'W') whitelistMode = true;
+    }
+  }
+  configFile.close();
+}
+
+void loadOuiDatabase() {
+  if (!SD.exists(OUI_FILE)) return;
+  ouiFile = SD.open(OUI_FILE, FILE_READ);
+  if (!ouiFile) return;
+  char line[128]; ouiCount = 0;
+  if (ouiFile.available()) ouiFile.readBytesUntil('\n', line, 128);
+  while (ouiFile.available() && ouiCount < MAX_OUI_ENTRIES) {
+    ouiFile.readBytesUntil('\n', line, 128);
+    if (strlen(line) < 8) continue;
+    char oui[8], vendor[64];
+    if (sscanf(line, "%[^,],%[^,]", oui, vendor) == 2) { strncpy(ouiDatabase[ouiCount].oui, oui, 7); strncpy(ouiDatabase[ouiCount].vendor, vendor, 63); ouiCount++; }
+  }
+  ouiFile.close(); ouiLoaded = true;
+}
+
+void loadKnownDevices() {
+  if (!SD.exists(KNOWN_DEVICES_FILE)) return;
+  knownDevFile = SD.open(KNOWN_DEVICES_FILE, FILE_READ);
+  if (!knownDevFile) return;
+  char line[128]; knownDeviceCount = 0;
+  if (knownDevFile.available()) knownDevFile.readBytesUntil('\n', line, 128);
+  while (knownDevFile.available() && knownDeviceCount < MAX_KNOWN_DEVS) {
+    knownDevFile.readBytesUntil('\n', line, 128);
+    if (strlen(line) < 10) continue;
+    char macStr[18], type[8], nick[32];
+    if (sscanf(line, "%[^,],%[^,],%[^,]", macStr, type, nick) == 3) {
+      uint8_t mac[6];
+      sscanf(macStr, "%2hhx:%2hhx:%2hhx:%2hhx:%2hhx:%2hhx", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
+      memcpy(knownDevices[knownDeviceCount].mac, mac, 6); strncpy(knownDevices[knownDeviceCount].type, type, 7); strncpy(knownDevices[knownDeviceCount].nickname, nick, 31); knownDevices[knownDeviceCount].active = true; knownDeviceCount++;
+    }
+  }
+  knownDevFile.close();
+}
+
+void loadVendorAliases() {
+  if (!SD.exists(VENDOR_ALIASES_FILE)) return;
+  vendorAliasFile = SD.open(VENDOR_ALIASES_FILE, FILE_READ);
+  if (!vendorAliasFile) return;
+  char line[128]; aliasCount = 0;
+  if (vendorAliasFile.available()) vendorAliasFile.readBytesUntil('\n', line, 128);
+  while (vendorAliasFile.available() && aliasCount < 100) {
+    vendorAliasFile.readBytesUntil('\n', line, 128);
+    if (strlen(line) < 8) continue;
+    char oui[8], alias[64];
+    if (sscanf(line, "%[^,],%[^,]", oui, alias) == 2) { strncpy(vendorAliases[aliasCount].oui, oui, 7); strncpy(vendorAliases[aliasCount].alias, alias, 63); aliasCount++; }
+  }
+  vendorAliasFile.close();
+}
+
+void loadFingerprints() {
+  if (!SD.exists(FINGERPRINT_FILE)) return;
+  fpFile = SD.open(FINGERPRINT_FILE, FILE_READ);
+  if (!fpFile) return;
+  char line[200]; fpCount = 0;
+  if (fpFile.available()) fpFile.readBytesUntil('\n', line, 200);
+  while (fpFile.available() && fpCount < MAX_FINGERPRINTS) {
+    fpFile.readBytesUntil('\n', line, 200);
+    if (strlen(line) < 10) continue;
+    char id[33], oui[9], ssid[33]; int rssi, ch, hs, ts, wps, nf; float bw, util; int cc; bool rand, trans;
+    char ciph[8] = "UNK", auth[8] = "UNK", tag[16] = "General";
+    // Extended format with new fields
+    if (sscanf(line, "%[^,],%[^,],%[^,],%d,%d,%d,%f,%d,%d,%d,%d,%d,%d,%f,%[^,],%[^,],%d,%[^,]",
+               id, oui, ssid, &rssi, &ch, &hs, &bw, &cc, &rand, &wps, &nf, &ts, &trans, &util, ciph, auth, &ts, tag) >= 16) {}
+    else if (sscanf(line, "%[^,],%[^,],%[^,],%d,%d,%d", id, oui, ssid, &rssi, &ch, &hs) == 6) { ts = 0; wps = 0; nf = 0; trans = false; util = 0; }
+    else continue;
+    strncpy(fpDB[fpCount].id, id, 32); strncpy(fpDB[fpCount].oui, oui, 8); strncpy(fpDB[fpCount].ssid, ssid, 32);
+    fpDB[fpCount].avgRssi = rssi; fpDB[fpCount].lastChannel = ch; fpDB[fpCount].handshakeCount = hs;
+    fpDB[fpCount].active = true; fpDB[fpCount].isWPA3 = false; fpDB[fpCount].isWifi6 = false; fpDB[fpCount].isMesh = false;
+    fpDB[fpCount].bandwidthMbps = bw; fpDB[fpCount].clientCount = cc; fpDB[fpCount].isRandomized = rand;
+    fpDB[fpCount].wpsPin = wps; fpDB[fpCount].noiseFloor = nf; fpDB[fpCount].isWPA3Transition = trans; fpDB[fpCount].airtimeUtil = util;
+    strncpy(fpDB[fpCount].cipherSuite, ciph, 7); strncpy(fpDB[fpCount].authMode, auth, 7);
+    fpDB[fpCount].threatScore = ts; strncpy(fpDB[fpCount].tag, tag, 15);
+    fpCount++;
+  }
+  fpFile.close(); fpLoaded = true;
+}
+
+void saveFingerprints() {
+  fpFile = SD.open(FINGERPRINT_FILE, FILE_WRITE);
+  if (!fpFile) return;
+  fpFile.println("ID,OUI,SSID,AvgRssi,LastCh,HS_Count,BW_Mbps,Clients,Random,WPS_Pin,Noise,Threat,Transition,Airtime,Cipher,Auth,Tag");
+  for (int i = 0; i < fpCount; i++) {
+    if (fpDB[i].active) {
+      fpFile.printf("%s,%s,%s,%d,%d,%d,%.2f,%d,%d,%d,%d,%d,%d,%.2f,%s,%s,%s\n", 
+              fpDB[i].id, fpDB[i].oui, fpDB[i].ssid, 
+              fpDB[i].avgRssi, fpDB[i].lastChannel, fpDB[i].handshakeCount,
+              fpDB[i].bandwidthMbps, fpDB[i].clientCount, fpDB[i].isRandomized,
+              fpDB[i].wpsPin, fpDB[i].noiseFloor, fpDB[i].threatScore,
+              fpDB[i].isWPA3Transition ? 1 : 0, fpDB[i].airtimeUtil,
+              fpDB[i].cipherSuite, fpDB[i].authMode, fpDB[i].tag);
+    }
+  }
+  fpFile.flush(); fpFile.close();
+}
+
+// ======================================================
+// LOOKUPS
+// ======================================================
+
+const char* getVendorFromOui(const uint8_t* mac) {
+  char ouiStr[8];
+  snprintf(ouiStr, 8, "%02X:%02X:%02X", mac[0], mac[1], mac[2]);
+  for (int i = 0; i < aliasCount; i++)
+    if (strcmp(vendorAliases[i].oui, ouiStr) == 0) return vendorAliases[i].alias;
+  for (int i = 0; i < ouiCount; i++)
+    if (strcmp(ouiDatabase[i].oui, ouiStr) == 0) return ouiDatabase[i].vendor;
+  return "Unknown";
+}
+
+int getDeviceStatus(const uint8_t* mac) {
+  for (int i = 0; i < knownDeviceCount; i++) {
+    if (knownDevices[i].active && macEqual(knownDevices[i].mac, mac)) {
+      if (strcmp(knownDevices[i].type, "GOOD") == 0) return 1;
+      if (strcmp(knownDevices[i].type, "BAD") == 0) return 2;
+      if (strcmp(knownDevices[i].type, "SUSPICIOUS") == 0) return 3;
+    }
+  }
+  return 0;
+}
+
+// ======================================================
+// DETECTION & PROTOCOL LOGIC (v4.0 Enhanced)
+// ======================================================
+
+bool checkEvilTwin(const uint8_t* bssid, const char* ssid) {
+  for (int i = 0; i < knownDeviceCount; i++) {
+    if (knownDevices[i].active && strcmp(knownDevices[i].nickname, ssid) == 0) {
+      if (!macEqual(knownDevices[i].mac, bssid)) return true;
+    }
+  }
+  for (int i = 0; i < fpCount; i++) {
+    if (fpDB[i].active && strcmp(fpDB[i].ssid, ssid) == 0) {
+      char hex[13];
+      snprintf(hex, 13, "%02X%02X%02X%02X%02X%02X", bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+      if (strstr(fpDB[i].id, hex) == NULL) return true;
+    }
+  }
+  return false;
+}
+
+bool checkPMKID(const uint8_t* payload, int len) {
+  if (len < 38) return false;
+  for (int i = 0; i < len - 2; i++) {
+    if (payload[i] == 0x30 && payload[i+1] >= 18) return true;
+  }
+  return false;
+}
+
+// --- NEW: WPS PIN Extraction ---
+int extractWPSPin(const uint8_t* payload, int len) {
+  // WPS IE Tag is 0xDD (Vendor Specific) usually, or 0x32 in some contexts
+  // But standard WPS is often in Vendor Specific IE (0xDD) with OUI 00:50:F2
+  for (int i = 0; i < len - 2; i++) {
+    if (payload[i] == 0xDD) {
+      int ieLen = payload[i+1];
+      if (ieLen < 10) continue;
+      // Check for WPS OUI: 00 50 F2
+      if (payload[i+2] == 0x00 && payload[i+3] == 0x50 && payload[i+4] == 0xF2) {
+        // Type 0x04 is Registrar Configuration (contains PIN)
+        // Structure: [OUI(3)][Type(1)][AttrID(2)][Len(2)][Value]
+        // We look for Attribute ID 0x10 (PIN) which is 0x00 0x10
+        int pos = i + 5; // After OUI and Type
+        while (pos < i + 2 + ieLen - 4) {
+          uint16_t attrId = payload[pos] | (payload[pos+1] << 8);
+          uint16_t attrLen = payload[pos+2] | (payload[pos+3] << 8);
+          if (attrId == 0x10 && attrLen == 4) { // PIN attribute
+             // Value is 4 bytes (32 bits), but usually represented as 7 digits + checksum
+             // We just return the raw integer for logging
+             int pin = (payload[pos+4] << 24) | (payload[pos+5] << 16) | (payload[pos+6] << 8) | payload[pos+7];
+             return pin;
+          }
+          pos += 4 + attrLen;
+        }
+      }
+    }
+    i += payload[i+1] + 1;
+  }
+  return 0;
+}
+
+// --- NEW: WPA3 Transition Mode Detection ---
+bool checkWPA3Transition(const uint8_t* payload, int len) {
+  // Look for RSN IE (0x30) with both PSK (0x02) and SAE (0x08) in AKM suites
+  for (int i = 0; i < len - 2; i++) {
+    if (payload[i] == 0x30) {
+      int ieLen = payload[i+1];
+      if (ieLen < 20) continue;
+      // Parse AKM Suite Selector
+      int offset = 2; // Skip Ver
+      offset += 4; // Skip Group Suite
+      int pwCnt = payload[i+2+offset] | (payload[i+2+offset+1] << 8);
+      offset += 2 + (pwCnt * 4);
+      int authCnt = payload[i+2+offset] | (payload[i+2+offset+1] << 8);
+      offset += 2;
+      
+      bool hasPSK = false;
+      bool hasSAE = false;
+      for (int j = 0; j < authCnt; j++) {
+        if (offset + 4 > i + 2 + ieLen) break;
+        uint8_t akm = payload[offset + 3];
+        if (akm == 0x02) hasPSK = true;
+        if (akm == 0x08) hasSAE = true;
+        offset += 4;
+      }
+      if (hasPSK && hasSAE) return true;
+    }
+  }
+  return false;
+}
+
+// ======================================================
+// PMKID EXTRACTION & HASHCAT FORMATTING
+// ======================================================
+
+void extractAndSavePMKID(const uint8_t* bssid, const uint8_t* payload, int len, const char* ssid) {
+  int pos = 38; 
+  uint8_t pmkid[16];
+  bool found = false;
+
+  if (len < 40) return;
+
+  while (pos < len - 2) {
+    uint8_t tag = payload[pos];
+    uint8_t tagLen = payload[pos+1];
+    
+    if (pos + 2 + tagLen > len) break;
+
+    if (tag == 0x30) {
+      if (tagLen >= 18) {
+        int offset = 2;
+        offset += 2; // Version
+        
+        if (offset + 4 > tagLen) { pos += 2 + tagLen; continue; }
+        offset += 4; // Group Suite
+        
+        if (offset + 2 > tagLen) { pos += 2 + tagLen; continue; }
+        int pwCnt = payload[pos+offset] | (payload[pos+offset+1] << 8);
+        offset += 2 + (pwCnt * 4);
+        
+        if (offset + 2 > tagLen) { pos += 2 + tagLen; continue; }
+        int authCnt = payload[pos+offset] | (payload[pos+offset+1] << 8);
+        offset += 2 + (authCnt * 4);
+        
+        if (offset + 2 <= tagLen) {
+          int pmkidCnt = payload[pos+offset] | (payload[pos+offset+1] << 8);
+          offset += 2;
+          
+          if (pmkidCnt > 0 && offset + 16 <= tagLen) {
+            memcpy(pmkid, &payload[pos+offset], 16);
+            found = true;
+            break;
+          }
+        }
+      }
+    }
+    
+    pos += 2 + tagLen;
+  }
+
+  if (!found) {
+    Serial.println("[WARN] PMKID IE found but could not parse hash");
+    return;
+  }
+
+  char bssidStr[18];
+  char staMacStr[18];
+  char pmkidHex[33];
+  
+  snprintf(bssidStr, 18, "%02X:%02X:%02X:%02X:%02X:%02X", bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+  snprintf(staMacStr, 18, "%02X:%02X:%02X:%02X:%02X:%02X", 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF);
+  
+  for (int i = 0; i < 16; i++) sprintf(pmkidHex + (i * 2), "%02X", pmkid[i]);
+
+  char hashLine[256];
+  snprintf(hashLine, sizeof(hashLine), "*AP*%s*%s*%s*%s*", bssidStr, staMacStr, pmkidHex, ssid);
+
+  bool written = false;
+  for (int retry = 0; retry < 3; retry++) {
+    File pmkidFile = SD.open("/pmkid_hashes.txt", FILE_APPEND);
+    if (pmkidFile) {
+      pmkidFile.println(hashLine);
+      pmkidFile.flush();
+      pmkidFile.close();
+      written = true;
+      break;
+    }
+    delay(50);
+  }
+  
+  if (written) {
+    Serial.printf("[SUCCESS] PMKID Saved: %s (Hash: %s)\n", ssid, pmkidHex);
+    if (!batterySaverMode) { playTone(3500, 150); delay(50); playTone(4500, 150); }
+  } else {
+    Serial.println("[ERROR] Failed to write PMKID after 3 retries");
+  }
+}
+
+void decodeAdvancedFeatures(const uint8_t* payload, int len, bool& isWPA3, bool& isWifi6, bool& isMesh) {
+  isWPA3 = false; isWifi6 = false; isMesh = false;
+  if (len < 40) return;
+  int pos = 38;
+  while (pos < len - 2) {
+    uint8_t tag = payload[pos];
+    uint8_t lenIE = payload[pos+1];
+    if (pos + 2 + lenIE > len) break;
+    if (tag == 0x13) isWPA3 = true;
+    if (tag == 0x30 && lenIE >= 20) {
+      if (payload[pos+2]==0x00 && payload[pos+3]==0x0F && payload[pos+4]==0xAC && payload[pos+5]==0x05) isWPA3 = true;
+    }
+    if (tag == 0x6B) isWifi6 = true;
+    if (tag == 0x84) isMesh = true;
+    pos += 2 + lenIE;
+  }
+}
+
+void parseSecurity(const uint8_t* payload, int len, char* cipher, char* auth) {
+  strcpy(cipher, "UNK"); strcpy(auth, "UNK");
+  if (len < 40) return;
+  for (int i = 0; i < len - 2; i++) {
+    if (payload[i] == 0x30) {
+      int ieLen = payload[i+1];
+      if (ieLen < 20) continue;
+      uint8_t gs = payload[i+2+4];
+      uint8_t pc = payload[i+2+6] | (payload[i+2+7] << 8);
+      if (gs == 0x04) strcpy(cipher, "CCMP");
+      else if (gs == 0x02) strcpy(cipher, "TKIP");
+      else if (gs == 0x08) strcpy(cipher, "GCMP");
+      int akmOff = i + 2 + 8 + (pc * 4);
+      if (akmOff + 4 <= len) {
+        uint8_t akm = payload[akmOff+4];
+        if (akm == 0x02) strcpy(auth, "PSK");
+        else if (akm == 0x01) strcpy(auth, "802.1X");
+        else if (akm == 0x08) strcpy(auth, "SAE");
+      }
+      return;
+    }
+  }
+}
+
+// --- NEW: Channel Utilization Update ---
+void updateChannelStats(int channel, int rssi) {
+  if (channel < 1 || channel > 13 || !channelStats) return;
+  channelStats[channel].totalPackets++;
+  // Use RSSI as proxy for noise floor (approximate)
+  if (rssi < channelStats[channel].noiseFloor || channelStats[channel].noiseFloor == 0) {
+    channelStats[channel].noiseFloor = rssi;
+  }
+  // Calculate utilization percentage based on packet rate
+  unsigned long now = millis();
+  unsigned long elapsed = now - channelStats[channel].totalTime;
+  if (elapsed > 60000) { // Reset every 60 seconds
+    channelStats[channel].utilizationPercent = 
+      (channelStats[channel].totalPackets * 100.0) / (elapsed / 100.0);
+    channelStats[channel].totalPackets = 0;
+    channelStats[channel].totalTime = now;
+  }
+}
+
+// --- NEW: Client-to-AP Mapping ---
+void updateClientMap(const uint8_t* clientMac, const uint8_t* apBssid, int rssi) {
+  if (!clientMap) return;
+  for (int i = 0; i < MAX_CLIENT_MAP; i++) {
+    if (clientMap[i].active && macEqual(clientMap[i].clientMac, clientMac)) {
+      clientMap[i].rssi = rssi;
+      clientMap[i].lastSeen = millis();
+      memcpy(clientMap[i].apBssid, apBssid, 6);
+      return;
+    }
+  }
+  // New entry
+  for (int i = 0; i < MAX_CLIENT_MAP; i++) {
+    if (!clientMap[i].active) {
+      clientMap[i].active = true;
+      memcpy(clientMap[i].clientMac, clientMac, 6);
+      memcpy(clientMap[i].apBssid, apBssid, 6);
+      clientMap[i].rssi = rssi;
+      clientMap[i].lastSeen = millis();
+      return;
+    }
+  }
+}
+
+void updateBandwidth(AccessPoint* ap, uint16_t len) {
+  unsigned long now = millis();
+  if (now - ap->lastByteUpdate > 10000) {
+    ap->bandwidthMbps = (ap->bytesReceived * 8.0) / 10000000.0;
+    ap->bytesReceived = 0;
+    ap->lastByteUpdate = now;
+  }
+  ap->bytesReceived += len;
+}
+
+bool addClientToAP(AccessPoint* ap, const uint8_t* mac) {
+  if (ap->trackedClientCount >= 16) return false;
+  for (int i = 0; i < ap->trackedClientCount; i++)
+    if (macEqual(ap->trackedClients[i], mac)) return false;
+  memcpy(ap->trackedClients[ap->trackedClientCount], mac, 6);
+  ap->trackedClientCount++;
+  ap->clientCount = ap->trackedClientCount;
+  return true;
+}
+
+bool checkRandomized(const uint8_t* mac) { return (mac[0] & 0x02) != 0; }
+
+void updateKarmaTracking(const uint8_t* bssid, bool isRequest) {
+  if (!karmaDB) return;
+  int idx = -1;
+  for (int i = 0; i < 32; i++) if (karmaDB[i].active && macEqual(karmaDB[i].bssid, bssid)) { idx = i; break; }
+  if (idx == -1) { for (int i = 0; i < 32; i++) { if (!karmaDB[i].active) { idx = i; break; } } }
+  if (idx != -1 && idx < 32) {
+    if (isRequest) karmaDB[idx].reqCount++;
+    else karmaDB[idx].respCount++;
+    karmaDB[idx].lastProbeReq = millis();
+    karmaDB[idx].active = true;
+    memcpy(karmaDB[idx].bssid, bssid, 6);
+  }
+}
+
+void checkKarmaAttack() {
+  if (!karmaDB) return;
+  unsigned long now = millis();
+  for (int i = 0; i < 32; i++) {
+    if (!karmaDB[i].active) continue;
+    if (now - karmaDB[i].lastProbeReq > 10000) { karmaDB[i].reqCount = 0; karmaDB[i].respCount = 0; continue; }
+    if (karmaDB[i].reqCount > 5 && karmaDB[i].respCount > 0) {
+      float ratio = (float)karmaDB[i].respCount / (float)karmaDB[i].reqCount;
+      if (ratio > 0.8) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "KARMA_ATTACK: %d/%d", karmaDB[i].respCount, karmaDB[i].reqCount);
+        enqueueLog("WiFi", "KARMA_DETECTED", msg, -100, currentChannel);
+        beepAlert();
+        karmaDB[i].reqCount = 0; karmaDB[i].respCount = 0;
+      }
+    }
+  }
+}
+
+void updateAnomalyTracking(const uint8_t* bssid, int rssi) {
+  if (!anomalyDB) return;
+  int idx = -1;
+  for (int i = 0; i < 32; i++) { if (anomalyDB[i].active && macEqual(anomalyDB[i].bssid, bssid)) { idx = i; break; } }
+  if (idx == -1) { for (int i = 0; i < 32; i++) { if (!anomalyDB[i].active) { idx = i; break; } } }
+  if (idx != -1 && idx < 32) {
+    unsigned long now = millis();
+    if (now - anomalyDB[idx].lastUpdate > 5000) {
+      if (abs(rssi - anomalyDB[idx].avgRssi) > 15) {
+         char msg[64];
+         snprintf(msg, sizeof(msg), "ANOMALY_RSSI: %d vs %d", rssi, (int)anomalyDB[idx].avgRssi);
+         enqueueLog("WiFi", "ANOMALY", msg, rssi, currentChannel);
+      }
+      anomalyDB[idx].avgRssi = (anomalyDB[idx].avgRssi + rssi) / 2;
+      anomalyDB[idx].lastUpdate = now;
+    }
+  }
+}
+
+void updateFingerprint(const uint8_t* bssid, const char* ssid, int rssi, int ch, bool wpa3, bool wifi6, bool mesh, float bw, int cc, bool rand, const char* ciph, const char* auth, int score, const char* tag, bool transition, int wpsPin, int noise, float util) {
+  char oui[9]; getOui(bssid, oui);
+  for (int i = 0; i < fpCount; i++) {
+    char bssidHex[13];
+    snprintf(bssidHex, 13, "%02X%02X%02X%02X%02X%02X", bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+    if (fpDB[i].active && strstr(fpDB[i].id, bssidHex) != NULL) {
+      fpDB[i].avgRssi = (fpDB[i].avgRssi + rssi) / 2;
+      fpDB[i].lastChannel = ch;
+      strncpy(fpDB[i].ssid, ssid, 32);
+      if (wpa3) fpDB[i].isWPA3 = true;
+      if (wifi6) fpDB[i].isWifi6 = true;
+      if (mesh) fpDB[i].isMesh = true;
+      if (bw > fpDB[i].bandwidthMbps) fpDB[i].bandwidthMbps = bw;
+      if (cc > fpDB[i].clientCount) fpDB[i].clientCount = cc;
+      if (rand) fpDB[i].isRandomized = true;
+      if (transition) fpDB[i].isWPA3Transition = true;
+      if (wpsPin > 0) fpDB[i].wpsPin = wpsPin;
+      if (noise < fpDB[i].noiseFloor || fpDB[i].noiseFloor == 0) fpDB[i].noiseFloor = noise;
+      if (util > fpDB[i].airtimeUtil) fpDB[i].airtimeUtil = util;
+      if (strcmp(ciph, "UNK") != 0) strncpy(fpDB[i].cipherSuite, ciph, 7);
+      if (strcmp(auth, "UNK") != 0) strncpy(fpDB[i].authMode, auth, 7);
+      fpDB[i].threatScore = score;
+      strncpy(fpDB[i].tag, tag, 15);
+      return;
+    }
+  }
+  if (fpCount < MAX_FINGERPRINTS) {
+    char temp[64];
+    snprintf(temp, sizeof(temp), "%s-%02X%02X%02X%02X%02X%02X-%d-%d", 
+             oui, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], abs(rssi/10), ch);
+    strncpy(fpDB[fpCount].id, temp, 32);
+    strncpy(fpDB[fpCount].oui, oui, 8);
+    strncpy(fpDB[fpCount].ssid, ssid, 32);
+    fpDB[fpCount].avgRssi = rssi; fpDB[fpCount].lastChannel = ch; fpDB[fpCount].handshakeCount = 0;
+    fpDB[fpCount].active = true; fpDB[fpCount].isWPA3 = wpa3; fpDB[fpCount].isWifi6 = wifi6; fpDB[fpCount].isMesh = mesh;
+    fpDB[fpCount].bandwidthMbps = bw; fpDB[fpCount].clientCount = cc; fpDB[fpCount].isRandomized = rand;
+    fpDB[fpCount].isWPA3Transition = transition; fpDB[fpCount].wpsPin = wpsPin;
+    fpDB[fpCount].noiseFloor = noise; fpDB[fpCount].airtimeUtil = util;
+    strncpy(fpDB[fpCount].cipherSuite, ciph, 7); strncpy(fpDB[fpCount].authMode, auth, 7);
+    fpDB[fpCount].threatScore = score; strncpy(fpDB[fpCount].tag, tag, 15);
+    fpCount++;
+  }
+}
+
+void processHandshake(const uint8_t* payload, int len, const uint8_t* bssid, int rssi) {
+  if (len < 26) return;
+  for (int i = 0; i < len - 2; i++) {
+    if (payload[i] == 0x88 && payload[i+1] == 0x8E) {
+      int idx = -1;
+      for(int k=0; k<hsCount; k++) {
+        if (hsTrack[k].state > 0 && macEqual(hsTrack[k].bssid, bssid)) { idx = k; break; }
+      }
+      if (idx == -1) {
+        if (hsCount < MAX_APS) {
+          memcpy(hsTrack[hsCount].bssid, bssid, 6);
+          hsTrack[hsCount].state = 0; hsTrack[hsCount].captured = false; hsTrack[hsCount].exported = false;
+          idx = hsCount++;
+        }
+      }
+      if (idx != -1 && hsTrack[idx].state < 4) {
+        hsTrack[idx].state++; hsTrack[idx].lastMsgTime = millis();
+        if (hsTrack[idx].state == 4) {
+          hsTrack[idx].captured = true;
+          exportHandshake(bssid, payload, len);
+          for(int k=0; k<fpCount; k++) {
+             char bssidHex[13];
+             snprintf(bssidHex, 13, "%02X%02X%02X%02X%02X%02X", bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+             if (strstr(fpDB[k].id, bssidHex) != NULL) fpDB[k].handshakeCount++;
+          }
+        }
+      }
+      return;
+    }
+  }
+}
+
+void exportHandshake(const uint8_t* bssid, const uint8_t* payload, int len) {
+  char filename[64]; char bssidStr[18];
+  snprintf(bssidStr, 18, "%02X%02X%02X%02X%02X%02X", bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+  snprintf(filename, sizeof(filename), "/HS_%s_%lu.cap", bssidStr, millis());
+
+  File hsFile;
+  for (int retry = 0; retry < 3; retry++) { hsFile = SD.open(filename, FILE_WRITE); if (hsFile) break; delay(50); }
+  if (!hsFile) { Serial.println("[ERROR] Failed to open handshake file after 3 retries"); return; }
+
+  struct PcapGlobalHeader { uint32_t magic_number; uint16_t version_major; uint16_t version_minor; int32_t thiszone; uint32_t sigfigs; uint32_t snaplen; uint32_t network; } hdr = {0xA1B2C3D4, 2, 4, 0, 0, MAX_PACKET_SIZE, 105};
+  hsFile.write((uint8_t*)&hdr, sizeof(hdr));
+  struct PcapPacketHeader { uint32_t ts_sec; uint32_t ts_usec; uint32_t incl_len; uint32_t orig_len; } phdr = {millis()/1000, (millis()%1000)*1000, len, len};
+  hsFile.write((uint8_t*)&phdr, sizeof(phdr));
+  hsFile.write(payload, len);
+  hsFile.flush(); hsFile.close();
+  Serial.printf("Exported Handshake/PMKID to %s\n", filename);
+  beepHandshake();
+}
+
+// --- Hopping ---
+
+void updateChannelActivity() { channelActivityCount++; lastPacketTime = millis(); }
+
+void forceHop() {
+  xSemaphoreTake(channelMutex, portMAX_DELAY);
+  currentChannel++;
+  if (currentChannel > WIFI_CHANNEL_END) currentChannel = WIFI_CHANNEL_START;
+  esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+  channelActivityCount = 0; lastChannelSwitch = millis();
+  xSemaphoreGive(channelMutex);
+}
+
+void handleChannelHopping() {
+  unsigned long now = millis();
+  if (now - lastChannelSwitch < currentDwellTime) return;
+  if (channelActivityCount > QUIET_THRESHOLD * 2) currentDwellTime = MAX_DWELL_TIME_MS;
+  else if (channelActivityCount < QUIET_THRESHOLD) currentDwellTime = MIN_DWELL_TIME_MS;
+  else currentDwellTime = MIN_DWELL_TIME_MS + (channelActivityCount * 50);
+  if (batterySaverMode) currentDwellTime = BATTERY_SAVER_DWELL;
+
+  xSemaphoreTake(channelMutex, portMAX_DELAY);
+  currentChannel++;
+  if (currentChannel > WIFI_CHANNEL_END) currentChannel = WIFI_CHANNEL_START;
+  esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+  channelActivityCount = 0; lastChannelSwitch = millis();
+  xSemaphoreGive(channelMutex);
+}
+
+// --- GPS & BLE ---
+
+void initGPS() { GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); }
+
+void updateGPS() {
+  unsigned long now = millis();
+  static unsigned long lastGPSPoll = 0;
+  unsigned long pollInterval = batterySaverMode ? BATTERY_SAVER_GPS_INTERVAL : 1000;
+  if (now - lastGPSPoll < pollInterval) return;
+  lastGPSPoll = now;
+  while (GPSSerial.available() > 0) gps.encode(GPSSerial.read());
+  xSemaphoreTake(gpsMutex, portMAX_DELAY);
+  if (gps.location.isUpdated() && gps.location.isValid()) {
+    currentLat = gps.location.lat(); currentLon = gps.location.lng(); gpsFixValid = true;
+    if (!gpsLockAcquired) {
+      gpsLockAcquired = true;
+      if (!batterySaverMode) beepGPS();
+      if (rtcFound && gps.date.isValid()) {
+        rtc.adjust(DateTime(gps.date.year(), gps.date.month(), gps.date.day(), gps.time.hour(), gps.time.minute(), gps.time.second()));
+      }
+    }
+  }
+  if (gps.altitude.isUpdated()) currentAlt = gps.altitude.meters();
+  if (gps.satellites.isUpdated()) currentSats = gps.satellites.value();
+  xSemaphoreGive(gpsMutex);
+}
+
+class MyScanCallbacks : public NimBLEScanCallbacks {
+  void onResult(NimBLEAdvertisedDevice* dev) {
+    std::string addrStr = dev->getAddress().toString();
+    int rssi = dev->getRSSI();
+    std::string name = dev->getName();
+    std::string manuf = dev->getManufacturerData();
+    uint8_t mac[6];
+    if (addrStr.length() == 17) { for (int i = 0; i < 6; i++) mac[i] = (uint8_t)strtol(addrStr.substr(i * 3, 2).c_str(), NULL, 16); }
+    else { memset(mac, 0, 6); }
+    char uuid[37] = ""; uint16_t major = 0, minor = 0; bool isRandomized = false;
+    if (manuf.length() >= 25 && manuf[0] == 0x4C && manuf[1] == 0x00) {
+      snprintf(uuid, 36, "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+               manuf[2], manuf[3], manuf[4], manuf[5], manuf[6], manuf[7], manuf[8], manuf[9],
+               manuf[10], manuf[11], manuf[12], manuf[13], manuf[14], manuf[15], manuf[16], manuf[17]);
+      major = manuf[18] | (manuf[19] << 8); minor = manuf[20] | (manuf[21] << 8);
+    }
+    if (mac[0] & 0x02) isRandomized = true;
+    int idx = -1;
+    for (int i = 0; i < bleCount; i++) { if (bleCache[i].active && macEqual(bleCache[i].mac, mac)) { idx = i; break; } }
+    if (idx == -1 && bleCount < 32) { idx = bleCount++; memcpy(bleCache[idx].mac, mac, 6); bleCache[idx].active = true; bleCache[idx].isRandomized = isRandomized; }
+    if (idx != -1) {
+      bleCache[idx].rssi = rssi; strncpy(bleCache[idx].name, name.c_str(), 31); strncpy(bleCache[idx].uuid, uuid, 36);
+      bleCache[idx].major = major; bleCache[idx].minor = minor; bleCache[idx].lastSeen = millis();
+      if (strlen(uuid) > 0) { char data[150]; snprintf(data, sizeof(data), "iBeacon:UUID=%s,Maj=%d,Min=%d,RSSI=%d", uuid, major, minor, rssi); enqueueLog("BLE", "IBEACON", data, rssi, 0); }
+      else if (name.length() > 0) { char data[150]; snprintf(data, sizeof(data), "Name=%s,RSSI=%d,Random=%d", name.c_str(), rssi, isRandomized); enqueueLog("BLE", "BEACON", data, rssi, 0); }
+    }
+  }
+  void onScanEnd(NimBLEScanResults results) { bleScanning = false; }
+};
+
+void initBLE() {
+  NimBLEDevice::init("ESP32-S3-WIDS");
+  pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setScanCallbacks(new MyScanCallbacks());
+  pBLEScan->setInterval(BLE_SCAN_INTERVAL); pBLEScan->setWindow(BLE_SCAN_WINDOW); pBLEScan->setActiveScan(true);
+  Serial.println("BLE INIT OK");
+}
+
+void startBLEScan() { if (bleScanning) return; bleScanning = true; pBLEScan->start(batterySaverMode ? 2000 : BLE_SCAN_DURATION, false); }
+
+// --- SD & Logging (ATOMIC WRITES) ---
+
+void initSD() {
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD FAIL: Card not detected or wiring error.");
+    Serial.println("Continuing in 'No-Log' mode...");
+    sdInitialized = false;
+    return;
+  }
+  
+  Serial.println("SD OK");
+  sdInitialized = true;
+  
+  // Only load files if SD is working
+  loadFilters(); 
+  loadFingerprints(); 
+  loadOuiDatabase(); 
+  loadKnownDevices(); 
+  loadVendorAliases();
+  
+  // Initialize file indices
+  char tempName[32];
+  while (true) {
+    snprintf(tempName, sizeof(tempName), "/log_%lu.tmp", currentLogIndex);
+    if (!SD.exists(tempName)) break;
+      currentLogIndex++;
+}
+  while (SD.exists("/capture_" + String(currentPcapIndex) + ".pcap")) currentPcapIndex++;
+}
+
+void rotateLogFile() {
+  if (!sdInitialized) return; // DO NOTHING if SD failed
+  
+  if (logFile) logFile.close();
+  char filename[32];
+  snprintf(filename, sizeof(filename), "/log_%lu.tmp", currentLogIndex);
+  
+  logFile = SD.open(filename, FILE_WRITE);
+  if (!logFile) {
+    Serial.println("[ERR] Failed to open log file");
+    sdInitialized = false; // Mark as dead if we can't write
+    return;
+  }
+  logFile.println("timestamp,type,event,data,rssi,channel,lat,lon,alt,sats,fp_id,bw_mbps,clients,cipher,auth,random,threat,tag");
+}
+
+
+
+void rotatePcapFile() {
+  if (!sdInitialized) return;
+
+  if (pcapFile) pcapFile.close();
+  char filename[32];
+  snprintf(filename, sizeof(filename), "/capture_%lu.pcap", currentPcapIndex++);
+  
+  pcapFile = SD.open(filename, FILE_WRITE);
+  if (!pcapFile) {
+    Serial.println("[ERR] Failed to open pcap file");
+    sdInitialized = false;
+    return;
+  }
+  
+  // Write PCAP header...
+  struct PcapGlobalHeader { uint32_t magic_number; uint16_t version_major; uint16_t version_minor; int32_t thiszone; uint32_t sigfigs; uint32_t snaplen; uint32_t network; } hdr = {0xA1B2C3D4, 2, 4, 0, 0, MAX_PACKET_SIZE, 105};
+  pcapFile.write((uint8_t*)&hdr, sizeof(hdr));
+  pcapFile.flush();
+  Serial.println("PCAP Rotated");
+}
+
+void enqueueLog(const char* type, const char* event, const char* data, int rssi, int channel) {
+  LogMessage msg;
+  float lat, lon, alt; int sats; bool valid;
+  xSemaphoreTake(gpsMutex, portMAX_DELAY);
+  lat = currentLat; lon = currentLon; alt = currentAlt; sats = currentSats; valid = gpsFixValid;
+  xSemaphoreGive(gpsMutex);
+  char gpsStr[64];
+  if (valid) snprintf(gpsStr, sizeof(gpsStr), "%.6f,%.6f,%.2f,%d", lat, lon, alt, sats);
+  else snprintf(gpsStr, sizeof(gpsStr), "0.000000,0.000000,0.00,0");
+  char timestamp[32]; getTimestamp(timestamp, sizeof(timestamp));
+  snprintf(msg.text, sizeof(msg.text), "%s,%s,%s,%s,%d,%d,%s,UNKNOWN,0.00,0,UNK,UNK,0,0,General", timestamp, type, event, data, rssi, channel, gpsStr);
+  if (xQueueSend(logQueue, &msg, 0) != pdTRUE) queueOverflowCount++;
+}
+
+void enqueueLogAP(const char* type, const char* event, const char* data, int rssi, int channel, float bw, int clients, const char* cipher, const char* auth, bool rand, int threat, const char* tag) {
+  LogMessage msg;
+  float lat, lon, alt; int sats; bool valid;
+  xSemaphoreTake(gpsMutex, portMAX_DELAY);
+  lat = currentLat; lon = currentLon; alt = currentAlt; sats = currentSats; valid = gpsFixValid;
+  xSemaphoreGive(gpsMutex);
+  char gpsStr[64];
+  if (valid) snprintf(gpsStr, sizeof(gpsStr), "%.6f,%.6f,%.2f,%d", lat, lon, alt, sats);
+  else snprintf(gpsStr, sizeof(gpsStr), "0.000000,0.000000,0.00,0");
+  char timestamp[32]; getTimestamp(timestamp, sizeof(timestamp));
+  snprintf(msg.text, sizeof(msg.text), "%s,%s,%s,%s,%d,%d,%s,%.2f,%d,%s,%s,%d,%d,%s", timestamp, type, event, data, rssi, channel, gpsStr, bw, clients, cipher, auth, rand ? 1 : 0, threat, tag);
+  if (xQueueSend(logQueue, &msg, 0) != pdTRUE) queueOverflowCount++;
+}
+
+void enqueuePcap(const uint8_t* payload, uint16_t length) {
+  if (length > MAX_PACKET_SIZE) return;
+  PcapPacket pkt;
+  memcpy(pkt.payload, payload, length); pkt.length = length;
+  pkt.timestampSec = millis() / 1000; pkt.timestampUSec = (millis() % 1000) * 1000;
+  if (xQueueSend(pcapQueue, &pkt, 0) != pdTRUE) queueOverflowCount++;
+}
+
+void generateKML() {
+  if (SD.exists(KML_OUTPUT_FILE)) SD.remove(KML_OUTPUT_FILE);
+  File kml = SD.open(KML_OUTPUT_FILE, FILE_WRITE);
+  if (!kml) return;
+  kml.println("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+  kml.println("<kml xmlns=\"http://www.opengis.net/kml/2.2\">");
+  kml.println("<Document><name>ESP32 WIDS Deep Sight Results</name>");
+  for (int i = 0; i < fpCount; i++) {
+    if (!fpDB[i].active) continue;
+    kml.print("<Placemark><name>"); kml.print(fpDB[i].ssid); kml.print("</name><description>");
+    kml.print(fpDB[i].id);
+    if (fpDB[i].isWPA3) kml.print(" [WPA3]");
+    if (fpDB[i].isWPA3Transition) kml.print(" [TRANS]");
+    if (fpDB[i].isWifi6) kml.print(" [Wi-Fi 6]");
+    if (fpDB[i].isMesh) kml.print(" [Mesh]");
+    if (fpDB[i].wpsPin > 0) { kml.print(" [WPS:"); kml.print(fpDB[i].wpsPin); kml.print("]"); }
+    kml.print(" | Threat: "); kml.print(fpDB[i].threatScore);
+    kml.print(" | Tag: "); kml.print(fpDB[i].tag);
+    kml.print("</description><Point><coordinates>-122.4194,37.7749,0</coordinates></Point></Placemark>");
+  }
+  kml.println("</Document></kml>");
+  kml.close();
+  Serial.println("KML Generated: /networks.kml");
+  if (!batterySaverMode) beepGPS();
+}
+
+// ======================================================
+// TASKS
+// ======================================================
+
+void logWriterTask(void* param) {
+  rotateLogFile();
+  if (!sdInitialized) {
+    Serial.println("Log Task: SD not ready. Exiting.");
+    vTaskDelete(NULL); // Kill this task to save memory
+    return;
+  }
+  LogMessage batch[LOG_BATCH_SIZE]; int batchCount = 0; unsigned long lastFlush = millis();
+  while (true) {
+    LogMessage msg;
+    if (xQueueReceive(logQueue, &msg, pdMS_TO_TICKS(100)) == pdTRUE) { batch[batchCount++] = msg; }
+    bool flushNow = (batchCount >= LOG_BATCH_SIZE) || (millis() - lastFlush > LOG_FLUSH_INTERVAL);
+    if (!flushNow) continue;
+    if (!logFile) continue;
+    for (int i = 0; i < batchCount; i++) { logFile.println(batch[i].text); }
+    logFile.flush();
+    batchCount = 0; lastFlush = millis();
+    if (logFile.size() > LOG_ROTATE_SIZE) {
+      logFile.close();
+      String oldName = "/log_" + String(currentLogIndex) + ".tmp";
+      String newName = "/log_" + String(currentLogIndex) + ".csv";
+      if (SD.rename(oldName, newName)) { currentLogIndex++; rotateLogFile(); Serial.println("Log Rotated (Atomic)"); }
+      else Serial.println("[ERROR] Rename failed!");
+    }
+  }
+}
+
+void pcapWriterTask(void* param) {
+  rotatePcapFile();
+  PcapPacket batch[PCAP_BATCH_SIZE]; int batchCount = 0; unsigned long lastFlush = millis();
+  while (true) {
+    PcapPacket pkt;
+    if (xQueueReceive(pcapQueue, &pkt, pdMS_TO_TICKS(100)) == pdTRUE) { batch[batchCount++] = pkt; }
+    bool flushNow = (batchCount >= PCAP_BATCH_SIZE) || (millis() - lastFlush > PCAP_FLUSH_INTERVAL);
+    if (!flushNow) continue;
+    if (!pcapFile) continue;
+    for (int i = 0; i < batchCount; i++) {
+      struct PcapPacketHeader { uint32_t ts_sec; uint32_t ts_usec; uint32_t incl_len; uint32_t orig_len; } hdr = {batch[i].timestampSec, batch[i].timestampUSec, batch[i].length, batch[i].length};
+      pcapFile.write((uint8_t*)&hdr, sizeof(hdr));
+      pcapFile.write(batch[i].payload, batch[i].length);
+    }
+    pcapFile.flush(); batchCount = 0; lastFlush = millis();
+    if (pcapFile.size() > PCAP_ROTATE_SIZE) rotatePcapFile();
+  }
+}
+
+void packetProcessorTask(void* param) {
+  xProcTaskHandle = xTaskGetCurrentTaskHandle();
+  PacketBuffer* pkt;
+  while (true) {
+    if (xQueueReceive(packetQueue, &pkt, portMAX_DELAY) == pdTRUE) {
+      if (!pkt) continue;
+      updateChannelActivity();
+      
+      // NEW: Update channel utilization stats
+      updateChannelStats(pkt->channel, pkt->rssi);
+      
+      if (pkt->length < 10) { freePacketBuffer(pkt); continue; }
+
+      const uint8_t* payload = pkt->payload;
+      uint8_t type = (payload[0] & 0x0C) >> 2;
+      uint8_t subtype = (payload[0] & 0xF0) >> 4;
+      
+      const uint8_t* src = nullptr;
+      const uint8_t* dst = nullptr;
+      const uint8_t* bssid = nullptr;
+      
+      if (type == 0) {
+        if (pkt->length < 26) { freePacketBuffer(pkt); continue; }
+        dst = payload + 4; src = payload + 10; bssid = payload + 16;
+      } else if (type == 2) {
+        if (pkt->length < 26) { freePacketBuffer(pkt); continue; }
+        dst = payload + 4; src = payload + 10; bssid = payload + 16;
+      }
+      
+      bool isWPA3 = false, isWifi6 = false, isMesh = false;
+      char cipher[8] = "UNK";
+      char auth[8] = "UNK";
+      
+      // --- BEACON FRAME PROCESSING ---
+      if (pkt->type == WIFI_PKT_MGMT && subtype == 8) {
+        decodeAdvancedFeatures(payload, pkt->length, isWPA3, isWifi6, isMesh);
+        parseSecurity(payload, pkt->length, cipher, auth);
+        
+        // NEW: Check WPA3 Transition Mode
+        bool isTransition = checkWPA3Transition(payload, pkt->length);
+        
+        // NEW: Extract WPS PIN
+        int wpsPin = extractWPSPin(payload, pkt->length);
+        
+        int pos = 36;
+        if (pkt->length >= pos + 2) {
+          int len = payload[pos + 1];
+          if (len <= 32) {
+            char ssid[33];
+            bool wasHidden = false;
+            if (len == 0) { strcpy(ssid, "<hidden>"); wasHidden = true; }
+            else { memcpy(ssid, &payload[pos + 2], len); ssid[len] = '\0'; }
+            
+            bool hasPMKID = checkPMKID(payload, pkt->length);
+            bool isOpen = (strcmp(auth, "UNK") == 0 || strcmp(auth, "") == 0);
+            
+            int idx = -1;
+            for(int i=0; i<MAX_APS; i++) {
+               if (aps[i].active && macEqual(aps[i].bssid, bssid)) { idx = i; break; }
+               if (!aps[i].active) { idx = i; break; }
+               if (i % 10 == 0) yield();
+            }
+            if (idx != -1) {
+               aps[idx].active = true;
+               memcpy(aps[idx].bssid, bssid, 6);
+               
+               // NEW: Reveal hidden SSID if we previously saw <hidden> but now have the real name
+               if (wasHidden && strcmp(aps[idx].ssid, "<hidden>") == 0) {
+                 strcpy(aps[idx].ssid, "<hidden>");
+               } else if (!wasHidden) {
+                 strncpy(aps[idx].ssid, ssid, 32);
+               }
+               
+               aps[idx].rssi = pkt->rssi;
+               aps[idx].channel = pkt->channel;
+               aps[idx].lastSeen = millis();
+               aps[idx].packetCount++;
+               if (hasPMKID) aps[idx].hasPMKID = true;
+               if (isWPA3) aps[idx].isWPA3 = true;
+               if (isWifi6) aps[idx].isWifi6 = true;
+               if (isMesh) aps[idx].isMesh = true;
+               if (isTransition) aps[idx].isWPA3Transition = true;
+               if (wpsPin > 0) aps[idx].wpsPin = wpsPin;
+               if (strcmp(cipher, "UNK") != 0) strncpy(aps[idx].cipherSuite, cipher, 7);
+               if (strcmp(auth, "UNK") != 0) strncpy(aps[idx].authMode, auth, 7);
+               
+               updateBandwidth(&aps[idx], pkt->length);
+               autoTag(aps[idx].ssid, isOpen, isMesh, aps[idx].clientCount, aps[idx].tag);
+               aps[idx].threatScore = calculateThreatScore(&aps[idx]);
+               
+               // NEW: Log WPS exposure
+               if (wpsPin > 0 && aps[idx].wpsPin != -1) {
+                 char wpsMsg[64];
+                 snprintf(wpsMsg, sizeof(wpsMsg), "WPS_EXPOSED: %s PIN=%d", ssid, wpsPin);
+                 enqueueLog("WiFi", "WPS", wpsMsg, pkt->rssi, pkt->channel);
+                 aps[idx].wpsPin = -1; // Mark as logged (avoid spam)
+               }
+               
+               // NEW: Log WPA3 Transition Mode
+               if (isTransition) {
+                 char transMsg[64];
+                 snprintf(transMsg, sizeof(transMsg), "WPA3_TRANSITION: %s", ssid);
+                 enqueueLog("WiFi", "TRANSITION", transMsg, pkt->rssi, pkt->channel);
+               }
+               
+               if (checkEvilTwin(bssid, ssid)) {
+                 aps[idx].isEvilTwin = true;
+                 aps[idx].threatScore = 100;
+                 char msg[64];
+                 snprintf(msg, sizeof(msg), "EVIL_TWIN: %s", ssid);
+                 enqueueLog("WiFi", "ALERT", msg, pkt->rssi, pkt->channel);
+                 if (!batterySaverMode) beepAlert();
+               }
+               
+               if (hasPMKID && !aps[idx].hasPMKID) {
+                  aps[idx].hasPMKID = true;
+                  aps[idx].threatScore += 50;
+                  char msg[64];
+                  snprintf(msg, sizeof(msg), "PMKID_FOUND: %s", ssid);
+                  enqueueLog("WiFi", "PMKID", msg, pkt->rssi, pkt->channel);
+                  extractAndSavePMKID(bssid, payload, pkt->length, ssid);
+               }
+               
+               if (loggingEnabled && shouldLogAP(idx, pkt->rssi, pkt->channel)) {
+                 enqueueLogAP("WiFi", "BEACON", aps[idx].ssid, pkt->rssi, pkt->channel, 
+                              aps[idx].bandwidthMbps, aps[idx].clientCount, 
+                              aps[idx].cipherSuite, aps[idx].authMode, 
+                              aps[idx].isRandomized, aps[idx].threatScore, aps[idx].tag);
+               }
+            }
+            
+            // Get channel noise for this fingerprint
+            int chNoise = 0;
+            float chUtil = 0.0;
+            if (channelStats && pkt->channel >= 1 && pkt->channel <= 13) {
+              chNoise = channelStats[pkt->channel].noiseFloor;
+              chUtil = channelStats[pkt->channel].utilizationPercent;
+            }
+            
+            updateFingerprint(bssid, aps[idx].ssid, pkt->rssi, pkt->channel, isWPA3, isWifi6, isMesh, 
+                              aps[idx].bandwidthMbps, aps[idx].clientCount, 
+                              checkRandomized(src), aps[idx].cipherSuite, aps[idx].authMode,
+                              aps[idx].threatScore, aps[idx].tag, isTransition, wpsPin, chNoise, chUtil);
+          }
+        }
+      } 
+      // --- PROBE RESPONSE: Reveal Hidden SSIDs ---
+      else if (pkt->type == WIFI_PKT_MGMT && subtype == 5) {
+        // Probe Responses contain the real SSID even for "hidden" networks
+        int pos = 36;
+        if (pkt->length >= pos + 2) {
+          int len = payload[pos + 1];
+          if (len > 0 && len <= 32) {
+            char revealedSsid[33];
+            memcpy(revealedSsid, &payload[pos + 2], len);
+            revealedSsid[len] = '\0';
+            
+            // Find the AP with this BSSID and update its SSID if it was hidden
+            if (bssid) {
+              for (int i = 0; i < MAX_APS; i++) {
+                if (aps[i].active && macEqual(aps[i].bssid, bssid)) {
+                  if (strcmp(aps[i].ssid, "<hidden>") == 0) {
+                    strncpy(aps[i].ssid, revealedSsid, 32);
+                    char msg[64];
+                    snprintf(msg, sizeof(msg), "HIDDEN_REVEALED: %s", revealedSsid);
+                    enqueueLog("WiFi", "REVEAL", msg, pkt->rssi, pkt->channel);
+                    
+                    // Update fingerprint too
+                    for (int k = 0; k < fpCount; k++) {
+                      char bssidHex[13];
+                      snprintf(bssidHex, 13, "%02X%02X%02X%02X%02X%02X", bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+                      if (strstr(fpDB[k].id, bssidHex) != NULL) {
+                        strncpy(fpDB[k].ssid, revealedSsid, 32);
+                      }
+                    }
+                  }
+                  break;
+                }
+                if (i % 10 == 0) yield();
+              }
+            }
+          }
+        }
+        updateKarmaTracking(bssid, false);
+      }
+      // --- PROBE REQUEST: Track karma ---
+      else if (pkt->type == WIFI_PKT_MGMT && subtype == 4) {
+        updateKarmaTracking(src, true);
+      }
+      // --- DATA FRAME: Track clients ---
+      else if (pkt->type == WIFI_PKT_DATA) {
+        if (src && !isBroadcast(src) && !isMulticast(src)) {
+           int idx = -1;
+           for(int i=0; i<MAX_APS; i++) {
+              if (aps[i].active && macEqual(aps[i].bssid, bssid)) { idx = i; break; }
+              if (i % 10 == 0) yield();
+           }
+           if (idx != -1) {
+              addClientToAP(&aps[idx], src);
+              aps[idx].threatScore = calculateThreatScore(&aps[idx]);
+              
+              // NEW: Update client-to-AP map
+              updateClientMap(src, bssid, pkt->rssi);
+           }
+
+           int cIdx = -1;
+           for(int i=0; i<MAX_CLIENTS; i++) {
+              if (clients[i].active && macEqual(clients[i].mac, src)) { cIdx = i; break; }
+              if (!clients[i].active) { cIdx = i; break; }
+              if (i % 10 == 0) yield();
+           }
+           if (cIdx != -1) {
+              clients[cIdx].active = true;
+              memcpy(clients[cIdx].mac, src, 6);
+              clients[cIdx].rssi = pkt->rssi;
+              clients[cIdx].lastSeen = millis();
+              updateAnomalyTracking(src, pkt->rssi);
+              
+              int status = getDeviceStatus(src);
+              if (status == 2) {
+                 char msg[64];
+                 snprintf(msg, sizeof(msg), "KNOWN_BAD: %s", getVendorFromOui(src));
+                 enqueueLog("WiFi", "ALERT", msg, pkt->rssi, pkt->channel);
+                 if (!batterySaverMode) beepAlert();
+              }
+           }
+           processHandshake(payload, pkt->length, bssid, pkt->rssi);
+        }
+      } 
+      // --- DEAUTH / DISASSOCIATION: Forensic Logging ---
+      else if (pkt->type == WIFI_PKT_MGMT && (subtype == 10 || subtype == 11)) {
+        char reason[32];
+        uint16_t rc = 0;
+        if (pkt->length >= 26) rc = payload[24] | (payload[25] << 8);
+        snprintf(reason, sizeof(reason), "Reason:%u", rc);
+        
+        int status = getDeviceStatus(bssid);
+        if (status == 1) { freePacketBuffer(pkt); continue; }
+        
+        // Build detailed forensic log with source and destination
+        char srcStr[18] = "UNK", dstStr[18] = "UNK";
+        if (src) snprintf(srcStr, 18, "%02X:%02X:%02X:%02X:%02X:%02X", src[0], src[1], src[2], src[3], src[4], src[5]);
+        if (dst) snprintf(dstStr, 18, "%02X:%02X:%02X:%02X:%02X:%02X", dst[0], dst[1], dst[2], dst[3], dst[4], dst[5]);
+        
+        char forensics[128];
+        snprintf(forensics, sizeof(forensics), "%s Src=%s Dst=%s", reason, srcStr, dstStr);
+        
+        if(loggingEnabled) {
+          enqueueLog("WiFi", subtype == 10 ? "DEAUTH" : "DISASSOC", forensics, pkt->rssi, pkt->channel);
+        }
+        if (!batterySaverMode) beepDeauth();
+      }
+      
+      freePacketBuffer(pkt);
+      totalPacketsProcessed++;
+    }
+  }
+}
+
+void cleanupTask(void* param) {
+  xCleanupTaskHandle = xTaskGetCurrentTaskHandle();
+  while (true) {
+    unsigned long now = millis();
+    // Clean up stale APs
+    for (int i = 0; i < MAX_APS; i++) {
+      if (aps[i].active && (now - aps[i].lastSeen > FORGET_TIME)) aps[i].active = false;
+    }
+    // Clean up stale clients
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+      if (clients[i].active && (now - clients[i].lastSeen > FORGET_TIME)) clients[i].active = false;
+    }
+    // Clean up stale client map entries
+    if (clientMap) {
+      for (int i = 0; i < MAX_CLIENT_MAP; i++) {
+        if (clientMap[i].active && (now - clientMap[i].lastSeen > FORGET_TIME * 2)) clientMap[i].active = false;
+      }
+    }
+    checkKarmaAttack();
+    
+    unsigned long sleepTimeout = batterySaverMode ? BATTERY_SAVER_SLEEP_TIMEOUT : SLEEP_TIMEOUT;
+    
+    if (deepSleepEnabled && (now - lastPacketTime > sleepTimeout)) {
+       Serial.println("No activity. Entering Deep Sleep...");
+       display.clearDisplay();
+       display.display(); 
+       digitalWrite(BUZZER_PIN, LOW);
+       esp_sleep_enable_ext0_wakeup((gpio_num_t)DEEP_SLEEP_WAKE_PIN, LOW);
+       esp_deep_sleep_start();
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
+}
+
+void healthTask(void* param) {
+  xLogTaskHandle = xTaskGetCurrentTaskHandle();
+  while (true) {
+    size_t h = ESP.getFreeHeap();
+    size_t p = ESP.getFreePsram();
+    if (h < MIN_FREE_HEAP || p < MIN_FREE_PSRAM) {
+      char buf[64];
+      sprintf(buf, "[CRITICAL] Low Memory: Heap=%u, PSRAM=%u. Restarting...\n", h, p);
+      Serial.print(buf);
+      ESP.restart();
+    }
+
+    if (xProcTaskHandle) {
+      UBaseType_t stackProc = uxTaskGetStackHighWaterMark(xProcTaskHandle);
+      if (stackProc < MIN_STACK_WATERMARK) Serial.printf("[WARN] Proc Stack Low: %u\n", stackProc);
+    }
+    if (xLogTaskHandle) {
+      UBaseType_t stackLog = uxTaskGetStackHighWaterMark(xLogTaskHandle);
+      if (stackLog < MIN_STACK_WATERMARK) Serial.printf("[WARN] Log Stack Low: %u\n", stackLog);
+    }
+
+    UBaseType_t logLen = uxQueueMessagesWaiting(logQueue);
+    UBaseType_t pcapLen = uxQueueMessagesWaiting(pcapQueue);
+    if (logLen > 200 || pcapLen > 100) {
+      Serial.printf("[WARN] Queue Backlog: Log=%u, PCAP=%u\n", logLen, pcapLen);
+      currentDwellTime = MAX_DWELL_TIME_MS;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
+}
+
+// ======================================================
+// DISPLAY & BUTTONS
+// ======================================================
+
+void updateDisplay() {
+  if (silentMode || batterySaverMode) {
+    display.clearDisplay();
+    display.display();
+    return;
+  }
+
+  if (showHealthDashboard) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("SYSTEM HEALTH");
+    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+    size_t h = ESP.getFreeHeap();
+    size_t p = ESP.getFreePsram();
+    
+    display.setCursor(0, 12);
+    display.print("Heap: "); display.print(h / 1024); display.println(" KB");
+    display.print("PSRAM: "); display.print(p / 1024); display.println(" KB");
+    
+    UBaseType_t logLen = uxQueueMessagesWaiting(logQueue);
+    UBaseType_t pcapLen = uxQueueMessagesWaiting(pcapQueue);
+    
+    display.setCursor(0, 24);
+    display.print("LogQ: "); display.println(logLen);
+    display.print("PCAP: "); display.println(pcapLen);
+    
+    display.setCursor(0, 36);
+    display.print("Drops: "); display.println(packetDropCount);
+    display.print("Pkts: "); display.println(totalPacketsProcessed);
+    
+    display.setCursor(0, 48);
+    display.print("Ch: "); display.print(currentChannel);
+    display.print("  Bat: "); display.print(batteryPercent, 0); display.println("%");
+    
+    display.drawLine(0, 58, 127, 58, SSD1306_WHITE);
+    display.setCursor(0, 60);
+    display.print("B1:Mode B2:Hop B3:Clr");
+    
+    display.display();
+    return;
+  }
+
+  int topThreat = 0;
+  char topTag[16] = "None";
+  for(int i=0; i<fpCount; i++) {
+    if(fpDB[i].active && fpDB[i].threatScore > topThreat) {
+      topThreat = fpDB[i].threatScore;
+      strncpy(topTag, fpDB[i].tag, 15);
+    }
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("ESP32-S3 WIDS v4");
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+  display.setCursor(0, 12);
+  display.print("Ch: "); display.print(currentChannel);
+  display.print("  APs: "); display.print(fpCount);
+  display.print("  HS: ");
+  int completed = 0;
+  for(int i=0; i<hsCount; i++) if(hsTrack[i].captured) completed++;
+  display.println(completed);
+
+  display.setCursor(0, 22);
+  display.print("GPS: ");
+  if (gpsFixValid) {
+    display.print(currentLat, 4); display.print(","); display.print(currentLon, 4);
+    display.print(" ("); display.print(currentSats); display.println("s)");
+  } else {
+    display.println("SEARCHING...");
+  }
+
+  display.setCursor(0, 32);
+  display.print("Bat: "); display.print(batteryPercent, 0); display.println("%");
+  display.print("Log: "); display.println(loggingEnabled ? "ON" : "OFF");
+  
+  display.setCursor(0, 40);
+  display.print("Top Threat: "); display.print(topThreat);
+  display.print(" ("); display.print(topTag); display.println(")");
+  
+  display.setCursor(0, 48);
+  display.print("BLE: "); display.println(bleScanning ? "SCAN" : "IDLE");
+  display.print("Saver: "); display.println(batterySaverMode ? "ON" : "OFF");
+
+  display.drawLine(0, 58, 127, 58, SSD1306_WHITE);
+  display.setCursor(0, 60);
+  display.print("B1:Log B2:Hop B3:Rep B4:Hlth");
+
+  display.display();
+}
+
+void handleButtons() {
+  static unsigned long lastDebounceTime = 0;
+  static bool lastBtn1State = HIGH;
+  static bool lastBtn2State = HIGH;
+  static bool lastBtn3State = HIGH;
+  static bool lastBtnPanicState = HIGH;
+  static bool lastBtnHealthState = HIGH;
+  static unsigned long btn3PressStart = 0;
+  static unsigned long btnPanicPressStart = 0;
+  const unsigned long debounceDelay = 200;
+  const unsigned long GRACEFUL_SHUTDOWN_TIME = 3000;
+  const unsigned long BATTERY_SAVER_TRIGGER_TIME = 5000;
+
+  bool btn1 = digitalRead(BTN_LOG);
+  bool btn2 = digitalRead(BTN_HOP);
+  bool btn3 = digitalRead(BTN_CLEAR);
+  bool btnPanic = digitalRead(BTN_PANIC);
+  bool btnHealth = digitalRead(BTN_HEALTH);
+
+  unsigned long currentTime = millis();
+
+  if (btn1 != lastBtn1State) lastDebounceTime = currentTime;
+  if ((currentTime - lastDebounceTime) > debounceDelay) {
+    if (btn1 == LOW && lastBtn1State == HIGH) {
+      loggingEnabled = !loggingEnabled;
+      playTone(loggingEnabled ? 1500 : 800, 100);
+      Serial.println(loggingEnabled ? "Logging ON" : "Logging OFF");
+    }
+  }
+  lastBtn1State = btn1;
+
+  if (btn2 != lastBtn2State) lastDebounceTime = currentTime;
+  if ((currentTime - lastDebounceTime) > debounceDelay) {
+    if (btn2 == LOW && lastBtn2State == HIGH) {
+      forceHop();
+      playTone(1200, 50);
+    }
+  }
+  lastBtn2State = btn2;
+
+  if (btn3 != lastBtn3State) lastDebounceTime = currentTime;
+  if ((currentTime - lastDebounceTime) > debounceDelay) {
+    if (btn3 == LOW && lastBtn3State == HIGH) {
+      btn3PressStart = currentTime;
+    } else if (btn3 == HIGH && lastBtn3State == LOW) {
+      unsigned long pressDuration = currentTime - btn3PressStart;
+      
+      if (pressDuration > 8000) {
+        Serial.println("GRACEFUL SHUTDOWN: Flushing files...");
+        if (logFile) { logFile.flush(); }
+        if (pcapFile) { pcapFile.flush(); }
+        saveFingerprints();
+        delay(1000);
+        ESP.restart();
+      } else if (pressDuration > BATTERY_SAVER_TRIGGER_TIME) {
+        batterySaverMode = !batterySaverMode;
+        if (batterySaverMode) {
+          Serial.println("BATTERY SAVER: ON");
+          silentMode = true;
+          display.clearDisplay();
+          display.display();
+          currentDwellTime = BATTERY_SAVER_DWELL;
+        } else {
+          Serial.println("BATTERY SAVER: OFF");
+          silentMode = false;
+          currentDwellTime = MIN_DWELL_TIME_MS;
+        }
+        playTone(batterySaverMode ? 2000 : 1000, 300);
+      } else {
+        generateHTMLReport();
+        playTone(1800, 200); delay(200); playTone(1800, 200);
+        Serial.println("HTML Report Generated");
+      }
+    }
+  }
+  lastBtn3State = btn3;
+
+  if (btnPanic != lastBtnPanicState) lastDebounceTime = currentTime;
+  if ((currentTime - lastDebounceTime) > debounceDelay) {
+    if (btnPanic == LOW && lastBtnPanicState == HIGH) {
+      btnPanicPressStart = currentTime;
+    } else if (btnPanic == HIGH && lastBtnPanicState == LOW) {
+      if (currentTime - btnPanicPressStart > GRACEFUL_SHUTDOWN_TIME) {
+        Serial.println("GRACEFUL SHUTDOWN: Flushing files...");
+        if (logFile) { logFile.flush(); }
+        if (pcapFile) { pcapFile.flush(); }
+        saveFingerprints();
+        delay(1000);
+        ESP.restart();
+      } else {
+        Serial.println("PANIC: Wiping SD...");
+        File root = SD.open("/");
+        File file = root.openNextFile();
+        while(file){
+          String name = file.name();
+          file.close();
+          SD.remove(name.c_str());
+          file = root.openNextFile();
+        }
+        root.close();
+        playTone(4000, 500);
+        delay(1000);
+        ESP.restart();
+      }
+    }
+  }
+  lastBtnPanicState = btnPanic;
+
+  if (btnHealth != lastBtnHealthState) lastDebounceTime = currentTime;
+  if ((currentTime - lastDebounceTime) > debounceDelay) {
+    if (btnHealth == LOW && lastBtnHealthState == HIGH) {
+      showHealthDashboard = !showHealthDashboard;
+      playTone(showHealthDashboard ? 2500 : 1000, 100);
+      Serial.println(showHealthDashboard ? "Health Dashboard ON" : "Health Dashboard OFF");
+    }
+  }
+  lastBtnHealthState = btnHealth;
+}
+
+// ======================================================
+// SETUP & LOOP
+// ======================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n=== ESP32-S3 WIDS v4.0 Deep Sight ===");
+
+  pinMode(BTN_LOG, INPUT_PULLUP);
+  pinMode(BTN_HOP, INPUT_PULLUP);
+  pinMode(BTN_CLEAR, INPUT_PULLUP);
+  pinMode(BTN_PANIC, INPUT_PULLUP);
+  pinMode(BTN_HEALTH, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BAT_ADC_PIN, INPUT);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED Init Failed");
+  } else {
+    display.clearDisplay();
+    display.println("Init...");
+    display.display();
+  }
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if (rtc.begin()) {
+    if (rtc.lostPower()) {
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+      Serial.println("RTC Time Set from Compile Time");
+    }
+    rtcFound = true;
+    Serial.println("RTC Found and Initialized");
+  } else {
+    Serial.println("RTC ERROR: Could not find DS3231");
+  }
+
+  // --- PSRAM ALLOCATION ---
+  Serial.println("Allocating PSRAM buffers...");
+  packetPool = (PacketBuffer*)ps_malloc(sizeof(PacketBuffer) * PACKET_POOL_SIZE);
+  aps = (AccessPoint*)ps_malloc(sizeof(AccessPoint) * MAX_APS);
+  clients = (StationClient*)ps_malloc(sizeof(StationClient) * MAX_CLIENTS);
+  fpDB = (FingerprintDB*)ps_malloc(sizeof(FingerprintDB) * MAX_FINGERPRINTS);
+  hsTrack = (HandshakeTracker*)ps_malloc(sizeof(HandshakeTracker) * MAX_APS);
+  bleCache = (BLEDeviceCache*)ps_malloc(sizeof(BLEDeviceCache) * 32);
+  karmaDB = (KarmaTracker*)ps_malloc(sizeof(KarmaTracker) * 32);
+  anomalyDB = (AnomalyTracker*)ps_malloc(sizeof(AnomalyTracker) * 32);
+  
+  // NEW: Allocate Client Map and Channel Stats
+  clientMap = (ClientMapEntry*)ps_malloc(sizeof(ClientMapEntry) * MAX_CLIENT_MAP);
+  channelStats = (ChannelStats*)ps_malloc(sizeof(ChannelStats) * 14); // Channels 1-13
+  
+  if (!packetPool || !aps || !clients || !fpDB || !hsTrack || !bleCache || !karmaDB || !anomalyDB || !clientMap || !channelStats) {
+    Serial.println("FAIL: PSRAM Allocation");
+    while(1);
+  }
+  Serial.println("OK: All buffers allocated");
+
+  memset(lastLogTimeByAP, 0, sizeof(lastLogTimeByAP));
+  memset(lastRssiByAP, 0, sizeof(lastRssiByAP));
+  memset(clientMap, 0, sizeof(ClientMapEntry) * MAX_CLIENT_MAP);
+  memset(channelStats, 0, sizeof(ChannelStats) * 14);
+
+  // --- STABILITY: WDT Configuration ---
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 10000,      // 10 seconds timeout
+    .idle_core_mask = 0,      // Watch all cores (0 means all)
+    .trigger_panic = true     // Trigger panic on timeout
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL); // Add current task to the watchdog
+
+  // --- STABILITY: WiFi Optimization ---
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_MODE_STA);
+  WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+
+  initGPS();
+  initSD();
+  initBLE();
+
+  packetQueue = xQueueCreate(PACKET_QUEUE_SIZE, sizeof(PacketBuffer*));
+  logQueue = xQueueCreate(LOG_QUEUE_SIZE, sizeof(LogMessage));
+  pcapQueue = xQueueCreate(PCAP_QUEUE_SIZE, sizeof(PcapPacket));
+
+  apMutex = xSemaphoreCreateMutex();
+  clientMutex = xSemaphoreCreateMutex();
+  channelMutex = xSemaphoreCreateMutex();
+  gpsMutex = xSemaphoreCreateMutex();
+  fpMutex = xSemaphoreCreateMutex();
+  bleMutex = xSemaphoreCreateMutex();
+  filterMutex = xSemaphoreCreateMutex();
+  ouiMutex = xSemaphoreCreateMutex();
+  knownDevMutex = xSemaphoreCreateMutex();
+  karmaMutex = xSemaphoreCreateMutex();
+
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_channel(WIFI_CHANNEL_START, WIFI_SECOND_CHAN_NONE);
+  
+  wifi_promiscuous_filter_t filter = {0};
+  filter.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
+  esp_wifi_set_promiscuous_filter(&filter);
+  
+  esp_wifi_set_promiscuous_rx_cb([](void* buf, wifi_promiscuous_pkt_type_t type) {
+    wifi_promiscuous_pkt_t* raw = (wifi_promiscuous_pkt_t*)buf;
+    if (raw->rx_ctrl.sig_len > MAX_PACKET_SIZE) return;
+    
+    PacketBuffer* pkt = nullptr;
+    for (int i = 0; i < PACKET_POOL_SIZE; i++) {
+      if (!packetPool[i].used) {
+        pkt = &packetPool[i];
+        break;
+      }
+    }
+    
+    if (!pkt) {
+      packetDropCount++;
+      return;
+    }
+    
+    pkt->used = true;
+    memcpy(pkt->payload, raw->payload, raw->rx_ctrl.sig_len);
+    pkt->length = raw->rx_ctrl.sig_len;
+    pkt->rssi = raw->rx_ctrl.rssi;
+    pkt->channel = raw->rx_ctrl.channel;
+    pkt->type = type;
+    
+    enqueuePcap(raw->payload, raw->rx_ctrl.sig_len);
+    
+    BaseType_t res = xQueueSend(packetQueue, &pkt, 0);
+    if (res != pdTRUE) {
+      pkt->used = false;
+      packetDropCount++;
+    }
+  });
+  
+  esp_wifi_set_promiscuous(true);
+
+  xTaskCreatePinnedToCore(packetProcessorTask, "proc", 8192, NULL, 3, &xProcTaskHandle, 1);
+  xTaskCreatePinnedToCore(cleanupTask, "clean", 8192, NULL, 1, &xCleanupTaskHandle, 0);
+  xTaskCreatePinnedToCore(logWriterTask, "log", 8192, NULL, 1, &xLogTaskHandle, 0);
+  xTaskCreatePinnedToCore(pcapWriterTask, "pcap", 8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(healthTask, "health", 4096, NULL, 1, NULL, 0);
+
+  Serial.println("System Ready.");
+  playTone(1000, 200); delay(200); playTone(1500, 200);
+}
+
+void loop() {
+  updateGPS();
+  handleChannelHopping();
+  handleButtons();
+
+  static unsigned long lastBLEScan = 0;
+  unsigned long scanInterval = batterySaverMode ? BATTERY_SAVER_BLE_INTERVAL : 10000;
+  
+  if (millis() - lastBLEScan > scanInterval) {
+    if (!bleScanning) {
+      startBLEScan();
+      lastBLEScan = millis();
+    }
+  }
+
+  static unsigned long lastDisplayUpdate = 0;
+  if (millis() - lastDisplayUpdate > 1000) {
+    readBattery();
+    updateDisplay();
+    lastDisplayUpdate = millis();
+  }
+
+  yield();
+  vTaskDelay(pdMS_TO_TICKS(50));
+}

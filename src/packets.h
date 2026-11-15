@@ -1,6 +1,8 @@
-// ===================== packets.h =====================
+// ============================================================
+// src/packets.h — Promiscuous capture, processor task
+// ============================================================
 #pragma once
 #include "globals.h"
 
 void packetProcessorTask(void* param);
-void enqueuePcap(const uint8_t* payload, uint16_t len);
+void installPromiscuousMode();  // call once after queues/mutexes exist

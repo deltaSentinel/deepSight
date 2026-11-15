@@ -1,8 +1,18 @@
-// ===================== sensors.h =====================
+// ============================================================
+// src/sensors.h — GPS, BLE, channel hopping
+// ============================================================
 #pragma once
 #include "globals.h"
 
-void sensorsInit();   // Wire.begin, rtc, GPS serial, SD (calls initSD), BLE init
-void sensorsUpdate(); // per-loop: GPS read, BLE scan scheduling, battery read
-float readBattery();
+// GPS
+void initGPS();
+void updateGPS();
+
+// BLE
+void initBLE();
 void startBLEScan();
+
+// Channel hopping
+void updateChannelActivity();
+void forceHop();
+void handleChannelHopping();
