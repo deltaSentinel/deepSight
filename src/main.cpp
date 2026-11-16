@@ -45,16 +45,35 @@ void setup() {
     Serial.println("RTC ERROR: Could not find DS3231");
   }
 
-  // --- PSRAM ALLOCATION ---
+  // --- PSRAM ALLOCATION (zeroed + per-buffer diagnostics) ---
   Serial.println("Allocating PSRAM buffers...");
-  packetPool = (PacketBuffer*)ps_malloc(sizeof(PacketBuffer) * PACKET_POOL_SIZE);
-  aps = (AccessPoint*)ps_malloc(sizeof(AccessPoint) * MAX_APS);
-  clients = (StationClient*)ps_malloc(sizeof(StationClient) * MAX_CLIENTS);
-  fpDB = (FingerprintDB*)ps_malloc(sizeof(FingerprintDB) * MAX_FINGERPRINTS);
-  hsTrack = (HandshakeTracker*)ps_malloc(sizeof(HandshakeTracker) * MAX_APS);
-  bleCache = (BLEDeviceCache*)ps_malloc(sizeof(BLEDeviceCache) * 32);
-  karmaDB = (KarmaTracker*)ps_malloc(sizeof(KarmaTracker) * 32);
-  anomalyDB = (AnomalyTracker*)ps_malloc(sizeof(AnomalyTracker) * 32);
+  auto psz = [](size_t n, size_t sz) -> void* {
+    return heap_caps_calloc(n, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  };
+
+  bool psramOK = true;
+  const char* failName = nullptr;
+
+  auto allocCheck = [&](void* p, const char* name) {
+    if (!p) { Serial.printf("FAIL: PSRAM alloc for %-12s (%u bytes)\n", name, (unsigned)0); psramOK = false; failName = name; }
+  };
+
+  packetPool = (PacketBuffer*)psz(PACKET_POOL_SIZE, sizeof(PacketBuffer));   allocCheck(packetPool, "packetPool");
+  aps        = (AccessPoint*)psz(MAX_APS, sizeof(AccessPoint));              allocCheck(aps, "aps");
+  clients    = (StationClient*)psz(MAX_CLIENTS, sizeof(StationClient));      allocCheck(clients, "clients");
+  fpDB       = (FingerprintDB*)psz(MAX_FINGERPRINTS, sizeof(FingerprintDB)); allocCheck(fpDB, "fpDB");
+  hsTrack    = (HandshakeTracker*)psz(MAX_APS, sizeof(HandshakeTracker));    allocCheck(hsTrack, "hsTrack");
+  bleCache   = (BLEDeviceCache*)psz(32, sizeof(BLEDeviceCache));             allocCheck(bleCache, "bleCache");
+  karmaDB    = (KarmaTracker*)psz(32, sizeof(KarmaTracker));                 allocCheck(karmaDB, "karmaDB");
+  anomalyDB  = (AnomalyTracker*)psz(32, sizeof(AnomalyTracker));             allocCheck(anomalyDB, "anomalyDB");
+  clientMap  = (ClientMapEntry*)psz(MAX_CLIENT_MAP, sizeof(ClientMapEntry)); allocCheck(clientMap, "clientMap");
+  channelStats = (ChannelStats*)psz(14, sizeof(ChannelStats));               allocCheck(channelStats, "channelStats");
+
+  if (!psramOK) {
+    Serial.printf("FAIL: PSRAM allocation — first failure: %s\n", failName);
+    while (1) delay(1000);
+  }
+  Serial.println("OK: All PSRAM buffers allocated and zeroed");
 
   // Client Map and Channel Stats
   clientMap = (ClientMapEntry*)ps_malloc(sizeof(ClientMapEntry) * MAX_CLIENT_MAP);
@@ -73,12 +92,22 @@ void setup() {
 
   // --- STABILITY: WDT Configuration ---
   esp_task_wdt_config_t wdt_config = {
-    .timeout_ms = 10000,      // 10 seconds timeout
-    .idle_core_mask = 0,      // Watch all cores (0 means all)
-    .trigger_panic = true     // Trigger panic on timeout
+    .timeout_ms = 10000,        // 10 seconds timeout
+    .idle_core_mask = 0,        // 0 = do NOT watch idle tasks (set (1<<0)|(1<<1) to watch both)
+    .trigger_panic = true       // Trigger panic on timeout
   };
-  esp_task_wdt_init(&wdt_config);
-  esp_task_wdt_add(NULL); // Add current task to the watchdog
+  esp_err_t wdt_err = esp_task_wdt_init(&wdt_config);
+  if (wdt_err != ESP_OK) {
+    Serial.printf("WDT init FAILED: %s — running without watchdog!\n", esp_err_to_name(wdt_err));
+  } else {
+    esp_err_t add_err = esp_task_wdt_add(NULL); // Subscribe loopTask
+    if (add_err != ESP_OK) {
+      Serial.printf("WDT subscribe FAILED: %s\n", esp_err_to_name(add_err));
+    } else {
+      wdtActive = true;
+      Serial.println("OK: Task WDT active (loopTask subscribed, 10s)");
+    }
+  }
 
   // --- STABILITY: WiFi Optimization ---
   WiFi.disconnect(true);
@@ -106,17 +135,26 @@ void setup() {
 
   installPromiscuousMode();
 
-  xTaskCreatePinnedToCore(packetProcessorTask, "proc", 8192, NULL, 3, &xProcTaskHandle, 1);
-  xTaskCreatePinnedToCore(cleanupTask, "clean", 8192, NULL, 1, &xCleanupTaskHandle, 0);
-  xTaskCreatePinnedToCore(logWriterTask, "log", 8192, NULL, 1, &xLogTaskHandle, 0);
-  xTaskCreatePinnedToCore(pcapWriterTask, "pcap", 8192, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(healthTask, "health", 4096, NULL, 1, NULL, 0);
+  auto createTask = [&](TaskFunction_t fn, const char* name, uint32_t stack,
+                        UBaseType_t prio, TaskHandle_t* handle, BaseType_t core) {
+    if (xTaskCreatePinnedToCore(fn, name, stack, NULL, prio, handle, core) != pdPASS) {
+      Serial.printf("FATAL: task creation failed: %s\n", name);
+      while (1) delay(1000);
+    }
+  };
+  createTask(packetProcessorTask, "proc",   8192, 3, &xProcTaskHandle,    1);
+  createTask(cleanupTask,         "clean",  8192, 1, &xCleanupTaskHandle, 0);
+  createTask(logWriterTask,       "log",    8192, 1, &xLogTaskHandle,     0);
+  createTask(pcapWriterTask,      "pcap",   8192, 1, nullptr,             0);
+  createTask(healthTask,          "health", 4096, 1, nullptr,             0);
 
   Serial.println("System Ready.");
   playTone(1000, 200); delay(200); playTone(1500, 200);
 }
 
 void loop() {
+  if (wdtActive) esp_task_wdt_reset(); //BUG [#1] resolution
+
   updateGPS();
   handleChannelHopping();
   handleButtons();
