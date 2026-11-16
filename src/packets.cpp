@@ -74,7 +74,7 @@ void packetProcessorTask(void* param) {
       char cipher[8] = "UNK";
       char auth[8] = "UNK";
 
-            // --- BEACON FRAME PROCESSING ---
+      // --- BEACON FRAME PROCESSING ---
       if (pkt->type == WIFI_PKT_MGMT && subtype == 8) {
         decodeAdvancedFeatures(payload, pkt->length, isWPA3, isWifi6, isMesh);
         parseSecurity(payload, pkt->length, cipher, auth);
@@ -104,20 +104,41 @@ void packetProcessorTask(void* param) {
                if (i % 10 == 0) yield();
             }
             if (idx != -1) {
-               aps[idx].active = true;
-               memcpy(aps[idx].bssid, bssid, 6);
+               bool fresh = !aps[idx].active;
+	       aps[idx].active = true;
+	       memcpy(aps[idx].bssid, bssid, 6);
 
                // Reveal hidden SSID if we previously saw <hidden> but now have the real name
-               if (wasHidden && strcmp(aps[idx].ssid, "<hidden>") == 0) {
+               if (fresh) {
+                  // Sanitize a newly claimed slot (calloc-zeroed on first boot,
+                  // but reused slots inherit stale data from cleanupTask expiry)
+                  strcpy(aps[idx].ssid, "");              // filled below from beacon
+                  strcpy(aps[idx].cipherSuite, "UNK");    // "" never matches the scorer's "UNK" check
+                  strcpy(aps[idx].authMode, "UNK");
+                  aps[idx].wpsPin = 0;                    // clears the -1 "already logged" marker
+                  aps[idx].packetCount = 0;
+                  aps[idx].isEvilTwin = false;
+                  aps[idx].hasPMKID = false;
+                  aps[idx].isWPA3 = false;
+                  aps[idx].isWifi6 = false;
+                  aps[idx].isMesh = false;
+                  aps[idx].isWPA3Transition = false;
+                  aps[idx].isRandomized = false;
+                  aps[idx].clientCount = 0;
+                  aps[idx].trackedClientCount = 0;        // don't inherit prior AP's client list
+                  aps[idx].bytesReceived = 0;
+                  aps[idx].lastByteUpdate = millis();     // start the bandwidth window now
+                  aps[idx].noiseFloor = 0;
+                  aps[idx].airtimeUtil = 0.0;
+               }
+
+	       if (wasHidden && strcmp(aps[idx].ssid, "<hidden>") == 0) {
                  strcpy(aps[idx].ssid, "<hidden>");
                } else if (!wasHidden) {
                  strncpy(aps[idx].ssid, ssid, 32);
+                 aps[idx].ssid[32] = '\0';   // optional hardening (see below)
                }
 
-               aps[idx].rssi = pkt->rssi;
-               aps[idx].channel = pkt->channel;
-               aps[idx].lastSeen = millis();
-               aps[idx].packetCount++;
                if (hasPMKID) aps[idx].hasPMKID = true;
                if (isWPA3) aps[idx].isWPA3 = true;
                if (isWifi6) aps[idx].isWifi6 = true;

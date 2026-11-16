@@ -341,7 +341,18 @@ void updateAnomalyTracking(const uint8_t* bssid, int rssi) {
   if (!anomalyDB) return;
   int idx = -1;
   for (int i = 0; i < 32; i++) { if (anomalyDB[i].active && macEqual(anomalyDB[i].bssid, bssid)) { idx = i; break; } }
-  if (idx == -1) { for (int i = 0; i < 32; i++) { if (!anomalyDB[i].active) { idx = i; break; } } }
+  if (idx == -1) { 
+	for (int i = 0; i < 32; i++) { 
+		if (!anomalyDB[i].active) {
+			idx = i;
+			anomalyDB[i].avgRssi = rssi;
+			anomalyDB[i].active  = true;
+			memcpy(anomalyDB[i].bssid, bssid, 6);
+			anomalyDB[i].lastUpdate = millis();
+		       	break; 
+		}
+	}
+  }
   if (idx != -1 && idx < 32) {
     unsigned long now = millis();
     if (now - anomalyDB[idx].lastUpdate > 5000) {
