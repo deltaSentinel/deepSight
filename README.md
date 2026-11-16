@@ -4,6 +4,7 @@
 ![License](https://img.shields.io/badge/License-GPL--3.0-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-ESP32--S3-informational.svg)
 ![Framework](https://img.shields.io/badge/Framework-Arduino%20%2F%20FreeRTOS-success.svg)
+[![Security](https://img.shields.io/badge/security-policy-blue)](./SECURITY.md)
 
 A passive WiFi + BLE intrusion detection and reconnaissance system built on the ESP32-S3, running on the Arduino framework with FreeRTOS multithreading.
 
