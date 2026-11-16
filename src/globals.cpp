@@ -44,7 +44,9 @@ volatile int currentChannel = WIFI_CHANNEL_START;
 unsigned long lastChannelSwitch = 0;
 volatile int channelActivityCount = 0;
 volatile int currentDwellTime = MIN_DWELL_TIME_MS;
+volatile int backlogDwellHops = 0;
 
+volatile bool wdtActive = false;
 bool sdInitialized = false;
 bool loggingEnabled = true;
 bool silentMode = false;

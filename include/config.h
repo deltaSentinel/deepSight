@@ -74,13 +74,18 @@
 #define DELTA_MIN_INTERVAL_MS           30000
 
 // BATTERY SAVER THRESHOLDS
-#define BATTERY_SAVER_DWELL             5000
+#define BATTERY_SAVER_DWELL_MLT         2 //was 5000, > MAX_DWELL_TIME_MS (3000)
 #define BATTERY_SAVER_BLE_INTERVAL      60000
 #define BATTERY_SAVER_GPS_INTERVAL      60000
 #define BATTERY_SAVER_SLEEP_TIMEOUT     120000
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
+
+#define BACKLOG_MAX_DWELL_HOPS          3
+
+static_assert(MIN_DWELL_TIME_MS <= MAX_DWELL_TIME_MS,
+		"dwell invariant violated: MIN must not exceed MAX");
 
 // ======================================================
 // STRUCT DEFINITIONS (verbatim)

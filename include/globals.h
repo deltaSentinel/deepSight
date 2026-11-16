@@ -62,6 +62,9 @@ extern bool showHealthDashboard;
 extern bool batterySaverMode;
 extern float batteryVoltage;
 extern float batteryPercent;
+extern volatile bool wdtActive;
+extern volatile int currentDwellTime;
+extern volatile int backlogDwellHops;
 
 extern unsigned long lastLogTimeByAP[MAX_APS];
 extern int lastRssiByAP[MAX_APS];

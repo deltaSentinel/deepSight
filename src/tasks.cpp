@@ -65,7 +65,7 @@ void healthTask(void* param) {
     UBaseType_t pcapLen = uxQueueMessagesWaiting(pcapQueue);
     if (logLen > 200 || pcapLen > 100) {
       Serial.printf("[WARN] Queue Backlog: Log=%u, PCAP=%u\n", logLen, pcapLen);
-      currentDwellTime = MAX_DWELL_TIME_MS;
+      backlogDwellHops = BACKLOG_MAX_DWELL_HOPS;
     }
 
     vTaskDelay(pdMS_TO_TICKS(5000));

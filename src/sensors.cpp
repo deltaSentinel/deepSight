@@ -4,6 +4,7 @@
 #include "sensors.h"
 #include "helpers.h"
 #include "logging.h"
+#include "globals.h"
 
 // ======================================================
 // CHANNEL HOPPING
@@ -23,10 +24,23 @@ void forceHop() {
 void handleChannelHopping() {
   unsigned long now = millis();
   if (now - lastChannelSwitch < currentDwellTime) return;
-  if (channelActivityCount > QUIET_THRESHOLD * 2) currentDwellTime = MAX_DWELL_TIME_MS;
-  else if (channelActivityCount < QUIET_THRESHOLD) currentDwellTime = MIN_DWELL_TIME_MS;
-  else currentDwellTime = MIN_DWELL_TIME_MS + (channelActivityCount * 50);
-  if (batterySaverMode) currentDwellTime = BATTERY_SAVER_DWELL;
+
+  unsigned long dwell;
+  if (backlogDwellHops > 0) {
+	  dwell = MAX_DWELL_TIME_MS;
+	  backlogDwellHops = backlogDwellHops - 1;
+  } else if (channelActivityCount > QUIET_THRESHOLD * 2) {
+    dwell = MAX_DWELL_TIME_MS;
+  } else if (channelActivityCount < QUIET_THRESHOLD) {
+    dwell = MIN_DWELL_TIME_MS;
+  } else {
+    dwell = MIN_DWELL_TIME_MS + ((unsigned long)channelActivityCount * 50);
+  }
+
+  if (batterySaverMode)
+    dwell = min(dwell * BATTERY_SAVER_DWELL_MLT, (unsigned long)MAX_DWELL_TIME_MS);
+
+  currentDwellTime = dwell;
 
   xSemaphoreTake(channelMutex, portMAX_DELAY);
   currentChannel = currentChannel + 1;
