@@ -165,7 +165,7 @@ void handleButtons() {
           silentMode = true;
           display.clearDisplay();
           display.display();
-          currentDwellTime = BATTERY_SAVER_DWELL;
+          currentDwellTime = BATTERY_SAVER_DWELL_MLT;
         } else {
           Serial.println("BATTERY SAVER: OFF");
           silentMode = false;
