@@ -1,5 +1,6 @@
 # Deep Sight Edition (v4.0)
 
+[![CI](https://github.com/deltaSentinel/deepSight/actions/workflows/ci.yml/badge.svg)](https://github.com/deltaSentinel/deepSight/actions/workflows/ci.yml)
 ![License](https://img.shields.io/badge/License-GPL--3.0-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-ESP32--S3-informational.svg)
 ![Framework](https://img.shields.io/badge/Framework-Arduino%20%2F%20FreeRTOS-success.svg)
