@@ -21,31 +21,19 @@ void installPromiscuousMode() {
     wifi_promiscuous_pkt_t* raw = (wifi_promiscuous_pkt_t*)buf;
     if (raw->rx_ctrl.sig_len > MAX_PACKET_SIZE) return;
 
-    PacketBuffer* pkt = nullptr;
-    for (int i = 0; i < PACKET_POOL_SIZE; i++) {
-      if (!packetPool[i].used) {
-        pkt = &packetPool[i];
-        break;
-      }
-    }
+    PacketBuffer* pkt = allocPacketBuffer();   // drop-counted internally on exhaustion
+    if (!pkt) return;
 
-    if (!pkt) {
-      packetDropCount = packetDropCount + 1;
-      return;
-    }
-
-    pkt->used = true;
+    pkt->length   = raw->rx_ctrl.sig_len;
+    pkt->rssi     = raw->rx_ctrl.rssi;
+    pkt->channel  = raw->rx_ctrl.channel;
+    pkt->type     = type;
     memcpy(pkt->payload, raw->payload, raw->rx_ctrl.sig_len);
-    pkt->length = raw->rx_ctrl.sig_len;
-    pkt->rssi = raw->rx_ctrl.rssi;
-    pkt->channel = raw->rx_ctrl.channel;
-    pkt->type = type;
 
     enqueuePcap(raw->payload, raw->rx_ctrl.sig_len);
 
-    BaseType_t res = xQueueSend(packetQueue, &pkt, 0);
-    if (res != pdTRUE) {
-      pkt->used = false;
+    if (xQueueSend(packetQueue, &pkt, 0) != pdTRUE) {
+      freePacketBuffer(pkt);                    // replaces the raw pkt->used = false
       packetDropCount = packetDropCount + 1;
     }
   });
@@ -86,7 +74,7 @@ void packetProcessorTask(void* param) {
       char cipher[8] = "UNK";
       char auth[8] = "UNK";
 
-      // --- BEACON FRAME PROCESSING ---
+            // --- BEACON FRAME PROCESSING ---
       if (pkt->type == WIFI_PKT_MGMT && subtype == 8) {
         decodeAdvancedFeatures(payload, pkt->length, isWPA3, isWifi6, isMesh);
         parseSecurity(payload, pkt->length, cipher, auth);
@@ -182,23 +170,25 @@ void packetProcessorTask(void* param) {
                               aps[idx].cipherSuite, aps[idx].authMode,
                               aps[idx].isRandomized, aps[idx].threatScore, aps[idx].tag);
                }
-            }
 
-            // Get channel noise for this fingerprint
-            int chNoise = 0;
-            float chUtil = 0.0;
-            if (channelStats && pkt->channel >= 1 && pkt->channel <= 13) {
-              chNoise = channelStats[pkt->channel].noiseFloor;
-              chUtil = channelStats[pkt->channel].utilizationPercent;
-            }
+               // Get channel noise for this fingerprint
+               int chNoise = 0;
+               float chUtil = 0.0;
+               if (channelStats && pkt->channel >= 1 && pkt->channel <= 13) {
+                 chNoise = channelStats[pkt->channel].noiseFloor;
+                 chUtil = channelStats[pkt->channel].utilizationPercent;
+               }
 
-            updateFingerprint(bssid, aps[idx].ssid, pkt->rssi, pkt->channel, isWPA3, isWifi6, isMesh,
-                              aps[idx].bandwidthMbps, aps[idx].clientCount,
-                              checkRandomized(src), aps[idx].cipherSuite, aps[idx].authMode,
-                              aps[idx].threatScore, aps[idx].tag, isTransition, wpsPin, chNoise, chUtil);
+               updateFingerprint(bssid, aps[idx].ssid, pkt->rssi, pkt->channel, isWPA3, isWifi6, isMesh,
+                                 aps[idx].bandwidthMbps, aps[idx].clientCount,
+                                 checkRandomized(src), aps[idx].cipherSuite, aps[idx].authMode,
+                                 aps[idx].threatScore, aps[idx].tag, isTransition, wpsPin, chNoise, chUtil);
+            }
+            // idx == -1: AP table full and BSSID not tracked — skip silently
           }
         }
       }
+
       // --- PROBE RESPONSE: Reveal Hidden SSIDs ---
       else if (pkt->type == WIFI_PKT_MGMT && subtype == 5) {
         // Probe Responses contain the real SSID even for "hidden" networks
